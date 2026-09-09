@@ -1,5 +1,6 @@
 """Discord bus contract tests for the Codex ↔ Hermes Ops handoff."""
 
+import os
 import sys
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -8,6 +9,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from gateway.config import Platform, PlatformConfig
+from gateway.run_inbound import GatewayInboundMixin
 from gateway.session import SessionSource
 from plugins.platforms.discord.handoff import (
     MAX_HANDOFF_MESSAGE_CHARS,
@@ -143,6 +145,7 @@ def discord_adapter(monkeypatch):
     monkeypatch.delenv("DISCORD_ALLOW_BOTS", raising=False)
     monkeypatch.delenv("DISCORD_ALLOWED_CHANNELS", raising=False)
     monkeypatch.delenv("DISCORD_IGNORED_CHANNELS", raising=False)
+    monkeypatch.delenv("DISCORD_CHANNEL_ROUTING", raising=False)
 
     adapter = discord_platform.DiscordAdapter(PlatformConfig(enabled=True, token="test-token"))
     adapter._client = SimpleNamespace(user=SimpleNamespace(id=999))
@@ -206,6 +209,130 @@ def test_admission_is_channel_sender_and_protocol_specific(discord_adapter, monk
         message_id=8,
     )
     assert discord_adapter._discord_message_admission(normal_with_global_bot_opt_in, claim=True) == (False, False)
+
+
+@pytest.mark.parametrize("author_id", [1545456768430121022, 1545113469244674209, 123456])
+def test_normal_channel_bots_are_always_rejected(discord_adapter, monkeypatch, author_id):
+    import plugins.platforms.discord.adapter as discord_platform
+
+    discord_adapter._test_message_type = discord_platform.discord.MessageType.default
+    monkeypatch.setenv("DISCORD_ALLOW_BOTS", "all")
+    message = _message(
+        discord_adapter, author_id=author_id, bot=True, channel_id=999,
+        content="hello", message_id=100 + author_id,
+    )
+
+    assert discord_adapter._discord_message_admission(message, claim=True) == (False, False)
+
+
+@pytest.mark.parametrize("route", ["nashi_drop", "notification_drop"])
+def test_runtime_channel_drop_routes_reject_before_llm(discord_adapter, monkeypatch, route):
+    import plugins.platforms.discord.adapter as discord_platform
+
+    discord_adapter._test_message_type = discord_platform.discord.MessageType.default
+    monkeypatch.setenv("DISCORD_ALLOW_ALL_USERS", "true")
+    discord_adapter.config.extra["channel_routing"] = {"routes": {route: ["999"]}}
+    message = _message(
+        discord_adapter, author_id=42, bot=False, channel_id=999,
+        content="hello", message_id=200 + len(route),
+    )
+
+    assert discord_adapter._discord_channel_route(message) == route
+    assert discord_adapter._discord_message_admission(message, claim=True) == (False, False)
+
+
+def test_runtime_route_conflict_fails_closed(discord_adapter):
+    import plugins.platforms.discord.adapter as discord_platform
+
+    discord_adapter._test_message_type = discord_platform.discord.MessageType.default
+    discord_adapter.config.extra["channel_routing"] = {
+        "routes": {"nashi_accept": ["999"], "nashi_drop": ["999"]},
+    }
+    message = _message(discord_adapter, author_id=42, bot=False, channel_id=999, content="hello", message_id=202)
+
+    assert discord_adapter._discord_channel_route(message) == "route_conflict"
+    assert discord_adapter._discord_message_admission(message, claim=True) == (False, False)
+
+
+def test_runtime_guild_allowlist_drops_before_user_auth(discord_adapter):
+    import plugins.platforms.discord.adapter as discord_platform
+
+    discord_adapter._test_message_type = discord_platform.discord.MessageType.default
+    discord_adapter.config.extra["channel_routing"] = {"allowed_guilds": ["701"]}
+    message = _message(discord_adapter, author_id=42, bot=False, channel_id=999, content="hello", message_id=203)
+
+    assert discord_adapter._discord_channel_route(message) == "guild_drop"
+    assert discord_adapter._discord_message_admission(message, claim=True) == (False, False)
+
+
+@pytest.mark.asyncio
+async def test_nashi_accept_relaxes_mention_and_thread_creation(discord_adapter, monkeypatch):
+    import plugins.platforms.discord.adapter as discord_platform
+
+    discord_adapter._test_message_type = discord_platform.discord.MessageType.default
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "true")
+    monkeypatch.setenv("DISCORD_ALLOW_ALL_USERS", "true")
+    discord_adapter.config.extra["channel_routing"] = {"routes": {"nashi_accept": ["999"]}}
+    discord_adapter._auto_create_thread = AsyncMock()
+    message = _message(discord_adapter, author_id=42, bot=False, channel_id=999, content="hello", message_id=204)
+
+    assert discord_adapter._discord_message_admission(message, claim=True) == (True, False)
+    assert await discord_adapter._handle_message(message) is True
+    discord_adapter.handle_message.assert_awaited_once()
+    discord_adapter._auto_create_thread.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_native_self_mention_metadata_is_preserved(discord_adapter, monkeypatch):
+    import plugins.platforms.discord.adapter as discord_platform
+
+    discord_adapter._test_message_type = discord_platform.discord.MessageType.default
+    monkeypatch.setenv("DISCORD_ALLOW_ALL_USERS", "true")
+    monkeypatch.setenv("DISCORD_HISTORY_BACKFILL", "false")
+    message = _message(
+        discord_adapter, author_id=42, bot=False, channel_id=999,
+        content="<@999> hello", message_id=205,
+    )
+    message.mentions = [discord_adapter._client.user]
+
+    assert await discord_adapter._handle_message(message) is True
+    event = discord_adapter.handle_message.await_args.args[0]
+    assert event.text == "hello"
+    assert event.metadata["discord_native_self_mention"] is True
+
+
+def test_gateway_surfaces_trusted_native_mention_metadata():
+    event = SimpleNamespace(metadata={"discord_native_self_mention": True})
+    source = SimpleNamespace(platform=Platform.DISCORD)
+
+    prepared = GatewayInboundMixin._prepend_inbound_trusted_discord_addressing(
+        event, source, "hello"
+    )
+
+    assert prepared.startswith("[Trusted Discord routing metadata:")
+    assert prepared.endswith("\n\nhello")
+
+
+def test_gateway_does_not_invent_trusted_metadata():
+    event = SimpleNamespace(metadata={})
+    source = SimpleNamespace(platform=Platform.DISCORD)
+
+    assert GatewayInboundMixin._prepend_inbound_trusted_discord_addressing(event, source, "hello") == "hello"
+
+
+def test_yaml_channel_routing_stays_adapter_local(monkeypatch):
+    import plugins.platforms.discord.adapter as discord_platform
+
+    monkeypatch.delenv("DISCORD_CHANNEL_ROUTING", raising=False)
+    routing = {"routes": {"nashi_accept": ["fixture-channel"]}}
+    seeded = discord_platform._apply_yaml_config(
+        {"platforms": {"discord": {"extra": {"channel_routing": routing}}}},
+        {},
+    )
+
+    assert seeded["channel_routing"] == routing
+    assert "DISCORD_CHANNEL_ROUTING" not in os.environ
 
 
 @pytest.mark.asyncio
