@@ -3799,10 +3799,14 @@ class BasePlatformAdapter(ABC):
         try:
             error_detail = str(e)[:300] if str(e) else "no details available"
             _thread_metadata = _thread_metadata_for_event(event)
+            error_content = (
+                f"Sorry, I encountered an error ({type(e).__name__}).\n{error_detail}\n"
+                "Try again or use /reset to start a fresh session."
+            )
             await self.send(
                 chat_id=event.source.chat_id,
-                content=(f"Sorry, I encountered an error ({type(e).__name__}).\n{error_detail}\n"
-                "Try again or use /reset to start a fresh session."), metadata=_thread_metadata)
+                content=self.format_response_for_delivery(event, error_content),
+                metadata=_thread_metadata)
         except Exception as notify_err:
             logger.error(
                 "[%s] Failed to send error notification to user: %s", self.name, notify_err, exc_info=True)
@@ -3886,6 +3890,15 @@ class BasePlatformAdapter(ABC):
             text_content=text_content, images=images, media_files=media_files,
             local_files=local_files, force_document_attachments=force_document, pre_extract=pre_extract)
 
+    def format_response_for_delivery(self, event: MessageEvent, response: str) -> str:
+        """Give a platform adapter a concrete final-response formatting seam.
+
+        The default preserves the existing delivery behavior. Platform-specific routes may use
+        event metadata to apply a transport contract immediately before the common extraction and
+        delivery pipeline; this is intentionally not an agent/router abstraction.
+        """
+        return response
+
     async def _fire_post_delivery_callback(self, session_key: str, interrupt_event: asyncio.Event) -> None:
         """Run the one-shot post-delivery callback (bounded, errors swallowed). The generation is
         read HERE — stamped on the interrupt event DURING the handler await; an earlier snapshot
@@ -3942,6 +3955,8 @@ class BasePlatformAdapter(ABC):
             is_ephemeral_response = isinstance(response, EphemeralReply)
             # Unwrap EphemeralReply for downstream text processing; TTL applies after send.
             response, _ephemeral_ttl = self._unwrap_ephemeral(response)
+            if response:
+                response = self.format_response_for_delivery(event, response)
             # None/empty is normal (streamed/queued). Suppress a stale response after an interrupt.
             if response and interrupt_event.is_set() and session_key in self._pending_messages:
                 logger.info("[%s] Suppressing stale response for interrupted session %s", self.name,
@@ -4101,7 +4116,8 @@ class BasePlatformAdapter(ABC):
         scope_id: Optional[str] = None, guild_id: Optional[str] = None,
         parent_chat_id: Optional[str] = None, message_id: Optional[str] = None,
         role_authorized: bool = False, auto_thread_created: bool = False,
-        auto_thread_initial_name: Optional[str] = None) -> SessionSource:
+        auto_thread_initial_name: Optional[str] = None,
+        trusted_discord_handoff: bool = False) -> SessionSource:
         """Build a SessionSource; with ``gateway.profile_routes`` configured the matching
         profile is stamped on ``source.profile`` for per-profile HERMES_HOME isolation."""
         def _opt(value) -> Optional[str]:
@@ -4125,7 +4141,8 @@ class BasePlatformAdapter(ABC):
                                self.platform, chat_id, exc_info=True)
         source = SessionSource(**fields, profile=profile, role_authorized=role_authorized,
                                auto_thread_created=auto_thread_created,
-                               auto_thread_initial_name=auto_thread_initial_name)
+                               auto_thread_initial_name=auto_thread_initial_name,
+                               trusted_discord_handoff=trusted_discord_handoff)
         # Transport-only, kept out of to_dict(): the receiving adapter is authoritative this turn
         # even if profile_routes picks another runtime; the reject flag is consumed before auth.
         source._transport_adapter_ref = weakref.ref(self)

@@ -32,3 +32,11 @@ optional_env:
     description: "Display name for the Discord home channel"
     prompt: "Home channel display name"
     password: false
+  - name: DISCORD_HANDOFF_CHANNEL_ID
+    description: "Dedicated Discord channel ID for Codex ↔ Hermes Ops handoffs"
+    prompt: "Ops handoff channel ID (optional)"
+    password: false
+  - name: HATSUGARASU_BOT_USER_ID
+    description: "Discord user ID allowed to submit Ops handoffs in the dedicated channel"
+    prompt: "Hatsugarasu bot user ID (optional)"
+    password: false
