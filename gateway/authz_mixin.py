@@ -421,6 +421,17 @@ class GatewayAuthorizationMixin:
 
     def _chat_scoped_grant(self, source, adapter_profile, is_group: bool, allow_adapter_delegation: bool) -> bool:
         """Grants that need no ``user_id`` (checked before the no-user-id guard)."""
+        # Discord's handoff bridge is a narrowly scoped adapter-verified exception to the normal
+        # bot rejection policy. The marker is wire-invisible and the live adapter re-validates the
+        # channel/sender before this grant; never use DISCORD_ALLOW_BOTS for this path.
+        if allow_adapter_delegation and (
+            getattr(source, "trusted_discord_handoff", False) is True
+            and source.platform == Platform.DISCORD
+        ):
+            adapter = self._adapter_for_source(source)
+            verifier = getattr(adapter, "is_trusted_handoff_source", None)
+            if callable(verifier) and verifier(source):
+                return True
         # Trusted-upstream delegation (relay): the connector authenticates this gateway's WS and
         # resolves owner bindings BEFORE delivering, so there is no local RELAY_ALLOWED_USERS. Not a
         # fail-open: fires only for events actually delivered over the relay WS

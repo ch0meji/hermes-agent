@@ -96,6 +96,10 @@ class SessionSource:
     # over the authenticated relay WebSocket. ``platform`` is the UNDERLYING platform, not
     # ``relay``, so authz must key upstream trust off THIS flag.
     delivered_via_upstream_relay: bool = False
+    # Wire-INVISIBLE trust signal set only by the Discord adapter after a channel, sender, and
+    # ops_handoff protocol check. It is intentionally omitted from to_dict() so restored or
+    # externally supplied sources cannot forge the bridge admission.
+    trusted_discord_handoff: bool = field(default=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         # Mirror scope_id/guild_id onto each other (scope_id wins) so readers of EITHER agree.

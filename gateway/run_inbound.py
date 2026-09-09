@@ -1488,6 +1488,24 @@ class GatewayInboundMixin:
         return message_text
 
     @staticmethod
+    def _prepend_inbound_trusted_discord_addressing(
+        event: MessageEvent, source: SessionSource, message_text: str
+    ) -> str:
+        """Restore trusted native-mention admission metadata after Discord text normalization."""
+        if (
+            source is not None
+            and getattr(source, "platform", None) == Platform.DISCORD
+            and isinstance(getattr(event, "metadata", None), dict)
+            and event.metadata.get("discord_native_self_mention")
+        ):
+            return (
+                "[Trusted Discord routing metadata: this message contains a native mention "
+                "of this bot and is addressed to Hermes.]\n\n"
+                f"{message_text}"
+            )
+        return message_text
+
+    @staticmethod
     def _prepend_inbound_reply_context(event: MessageEvent, source: SessionSource, message_text: str) -> str:
         """Prepend the Discord triggering-message id and the reply-to pointer."""
         # Discord: the triggering message id goes on the per-turn user message, never the cached
@@ -1629,6 +1647,7 @@ class GatewayInboundMixin:
             message_text = await self._enrich_inbound_voice(event, source, message_text, audio_paths)
         message_text = self._prepend_inbound_media_file_notes(message_text, audio_file_paths, video_paths)
         message_text = self._prepend_inbound_document_notes(event, message_text)
+        message_text = self._prepend_inbound_trusted_discord_addressing(event, source, message_text)
         if "@" in message_text:
             message_text = await self._expand_inbound_context_references(source, session_key, message_text)
             if message_text is None:

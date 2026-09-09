@@ -31,6 +31,13 @@ from urllib.parse import quote, urljoin
 
 from agent.async_utils import (consume_detached_task_result as _consume_background_task_result)
 from agent.display import ToolPreview
+from plugins.platforms.discord.handoff import (
+    HandoffDedupe,
+    OpsHandoff,
+    build_ops_execution_prompt,
+    format_ops_result,
+    parse_ops_handoff,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +89,8 @@ _DISCORD_COMMAND_SYNC_POLICIES = {"safe", "bulk", "off"}
 _DISCORD_COMMAND_SYNC_STATE_SUBDIR = "gateway"
 _DISCORD_COMMAND_SYNC_STATE_FILENAME = "discord_command_sync_state.json"
 _DISCORD_NONCONVERSATIONAL_STATE_FILENAME = "discord_nonconversational_messages.json"
+_DISCORD_CHANNEL_ROUTE_DROPS = frozenset({"nashi_drop", "notification_drop", "route_conflict"})
+_DISCORD_CHANNEL_ROUTES = frozenset({"nashi_accept", *_DISCORD_CHANNEL_ROUTE_DROPS})
 
 _DISCORD_COMMAND_SYNC_MUTATION_INTERVAL_SECONDS = 4.5
 _DISCORD_COMMAND_SYNC_MAX_RATE_LIMIT_SLEEP_SECONDS = 30.0
@@ -543,6 +552,7 @@ _GATE_ENV_KEYS = (
     "DISCORD_ALLOWED_USERS", "DISCORD_ALLOWED_ROLES", "DISCORD_ALLOWED_CHANNELS",
     "DISCORD_IGNORED_CHANNELS", "DISCORD_NO_THREAD_CHANNELS", "DISCORD_FREE_RESPONSE_CHANNELS",
     "DISCORD_MISSED_MESSAGE_BACKFILL_CHANNELS", "DISCORD_ALLOW_ALL_USERS", "DISCORD_ALLOW_BOTS",
+    "DISCORD_HANDOFF_CHANNEL_ID", "HATSUGARASU_BOT_USER_ID", "DISCORD_CHANNEL_ROUTING",
     "GATEWAY_ALLOW_ALL_USERS", "GATEWAY_ALLOWED_USERS",
 )
 
@@ -1011,6 +1021,15 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             return preview.text
         return _format_discord_markdown_link(preview.text, preview.url)
 
+    def format_response_for_delivery(self, event: MessageEvent, response: str) -> str:
+        """Format only the final response for a trusted Ops handoff event."""
+        metadata = getattr(event, "metadata", None) or {}
+        handoff = metadata.get("discord_handoff") if isinstance(metadata, dict) else None
+        handoff_id = handoff.get("handoff_id") if isinstance(handoff, dict) else None
+        if not handoff_id:
+            return response
+        return format_ops_result(handoff_id, response)
+
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.DISCORD)
         self._client: Optional[commands.Bot] = None
@@ -1079,6 +1098,9 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         self._discord_recovery_store = DiscordRecoveryStore(get_hermes_home())
         # Dedup cache: Discord RESUME replays events after reconnects.
         self._dedup = MessageDeduplicator()
+        # Process-local Codex↔Hermes handoff dedupe. This intentionally resets with the adapter;
+        # the bridge has no persistent task database.
+        self._handoff_dedupe = HandoffDedupe()
         # Reply threading mode: "off", "first" (default; first chunk only), "all" (every chunk).
         self._reply_to_mode: str = getattr(config, 'reply_to_mode', 'first') or 'first'
         self._slash_commands: bool = self.config.extra.get("slash_commands", True)
@@ -1367,34 +1389,55 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             return False, False
         if message.type not in {discord.MessageType.default, discord.MessageType.reply}:
             return False, False
-        role_authorized = False
+        channel_route = self._discord_channel_route(message)
+        if channel_route == "guild_drop":
+            logger.info("[%s] Dropping Discord message before LLM: guild not allowed", self.name)
+            return False, False
+        is_handoff_channel = self._is_discord_handoff_channel(message)
+        if is_handoff_channel:
+            # The dedicated channel is an inter-agent bus, not a general conversation lane.
+            # Require all three predicates before touching the existing bot policy.
+            if not getattr(message.author, "bot", False):
+                return False, False
+            if str(getattr(message.author, "id", "") or "") != self._hatsugarasu_bot_user_id():
+                return False, False
+            handoff = self._parse_discord_handoff(message)
+            if handoff is None or not self._handoff_channel_passes_channel_policy(message):
+                return False, False
+            if not self._handoff_dedupe.claim(message_id, handoff.handoff_id):
+                return False, False
+            return True, False
+        # A valid handoff payload outside the dedicated channel must never fall through to a
+        # globally configured DISCORD_ALLOW_BOTS=all/mentions normal-conversation lane.
+        if getattr(message.author, "bot", False) and parse_ops_handoff(getattr(message, "content", "")):
+            return False, False
+        # Bot-authored messages are never a normal task source. The dedicated, validated
+        # Hatsugarasu handoff exception above is the only bot ingress path.
         if getattr(message.author, "bot", False):
-            allow_bots = self._get_allow_bots()
-            if allow_bots == "none":
-                return False, False
-            if allow_bots == "mentions" and not self._self_is_explicitly_mentioned(message):
-                return False, False
-            if (
-                self._discord_bots_require_inline_mention()
-                and not self._self_is_raw_mentioned(message)
-            ):
-                return False, False
-        else:
-            msg_guild = getattr(message, "guild", None)
-            is_dm = isinstance(message.channel, discord.DMChannel) or msg_guild is None
-            msg_channel_ids = None
-            if not is_dm:
-                msg_channel_ids = {str(message.channel.id)}
-                parent_id = self._get_parent_channel_id(message.channel)
-                if parent_id:
-                    msg_channel_ids.add(parent_id)
-            if not self._is_allowed_user(
-                str(message.author.id), message.author, guild=msg_guild, is_dm=is_dm,
-                channel_ids=msg_channel_ids,
-            ):
-                self._warn_if_fail_closed_default()
-                return False, False
-            role_authorized = bool(getattr(self, "_allowed_role_ids", set()))
+            return False, False
+        role_authorized = False
+        msg_guild = getattr(message, "guild", None)
+        is_dm = isinstance(message.channel, discord.DMChannel) or msg_guild is None
+        msg_channel_ids = None
+        if not is_dm:
+            msg_channel_ids = {str(message.channel.id)}
+            parent_id = self._get_parent_channel_id(message.channel)
+            if parent_id:
+                msg_channel_ids.add(parent_id)
+        if not self._is_allowed_user(
+            str(message.author.id), message.author, guild=msg_guild, is_dm=is_dm,
+            channel_ids=msg_channel_ids,
+        ):
+            self._warn_if_fail_closed_default()
+            return False, False
+        role_authorized = bool(getattr(self, "_allowed_role_ids", set()))
+        if channel_route in _DISCORD_CHANNEL_ROUTE_DROPS:
+            logger.info(
+                "[%s] Dropping Discord message before LLM: route=%s",
+                self.name,
+                channel_route,
+            )
+            return False, False
         raw_self_mention = self._self_is_explicitly_mentioned(message)
         if not isinstance(message.channel, discord.DMChannel) and (
             message.mentions or raw_self_mention
@@ -1414,7 +1457,11 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                     parent_id = str(message.channel.parent_id)
                 free_channels = self._discord_free_response_channels()
                 channel_keys = self._discord_channel_keys(message, parent_id)
-                if "*" not in free_channels and not (channel_keys & free_channels):
+                if (
+                    channel_route != "nashi_accept"
+                    and "*" not in free_channels
+                    and not (channel_keys & free_channels)
+                ):
                     return False, False
         return True, role_authorized
 
@@ -1428,7 +1475,10 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         admitted, role_authorized = self._discord_message_admission(message, claim=True)
         if not admitted:
             return False
-        return await self._handle_message(message, role_authorized=role_authorized)
+        handoff = self._parse_discord_handoff(message)
+        if handoff is None:
+            return await self._handle_message(message, role_authorized=role_authorized)
+        return await self._handle_message(message, role_authorized=role_authorized, handoff=handoff)
 
     # --- gateway_platform_event fire-sites ---
 
@@ -2187,6 +2237,9 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
     async def _dispatch_recovered_message(self, message: Any) -> bool:
         """Run one recovered message through the live Discord ingress gates."""
         if not isinstance(message.channel, discord.DMChannel):
+            channel_route = self._discord_channel_route(message)
+            if channel_route in {"guild_drop", *_DISCORD_CHANNEL_ROUTE_DROPS}:
+                return False
             parent_id = self._get_parent_channel_id(message.channel)
             channel_keys = self._discord_channel_keys(message, parent_id)
             free_channels = self._discord_free_response_channels()
@@ -2194,6 +2247,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 self._discord_require_mention()
                 and "*" not in free_channels
                 and not (channel_keys & free_channels)
+                and channel_route != "nashi_accept"
                 and not self._in_bot_thread(message)
                 and not self._self_is_explicitly_mentioned(message)
             ):
@@ -2201,7 +2255,12 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         admitted, role_authorized = self._discord_message_admission(message, claim=False)
         if not admitted:
             return False
-        return await self._handle_message(message, role_authorized=role_authorized, recovered=True)
+        handoff = self._parse_discord_handoff(message)
+        if handoff is None:
+            return await self._handle_message(message, role_authorized=role_authorized, recovered=True)
+        return await self._handle_message(
+            message, role_authorized=role_authorized, recovered=True, handoff=handoff,
+        )
 
     async def _iter_missed_message_backfill_candidates(self, channel_ids: set[str]):
         if not self._client:
@@ -4670,6 +4729,195 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         """Per-profile DISCORD_ALLOW_BOTS mode (none|mentions|all)."""
         return self._gate_env("DISCORD_ALLOW_BOTS", "none").lower().strip() or "none"
 
+    def _discord_handoff_channel_id(self) -> str:
+        """Configured dedicated Discord channel for the Codex↔Hermes bridge."""
+        raw = self._gate_raw("handoff_channel_id", "DISCORD_HANDOFF_CHANNEL_ID")
+        value = str(raw or "").strip()
+        return value if value.isdigit() else ""
+
+    def _hatsugarasu_bot_user_id(self) -> str:
+        """Configured Hatsugarasu sender identity for the bridge."""
+        raw = self._gate_raw("hatsugarasu_bot_user_id", "HATSUGARASU_BOT_USER_ID")
+        value = str(raw or "").strip()
+        return value if value.isdigit() else ""
+
+    def _is_discord_handoff_channel(self, message: Any) -> bool:
+        """True for the configured channel or a thread whose parent is that channel."""
+        channel_id = str(getattr(getattr(message, "channel", None), "id", "") or "")
+        parent_id = self._get_parent_channel_id(getattr(message, "channel", None))
+        configured = self._discord_handoff_channel_id()
+        return bool(configured and (channel_id == configured or parent_id == configured))
+
+    def _discord_channel_routing_config(self) -> Optional[dict]:
+        """Return the optional runtime channel-routing policy.
+
+        The runtime customization predates the fork and used a small route map rather than a
+        second dispatcher. Keep that shape, while accepting JSON from the environment for
+        deployments that do not use ``config.yaml``. ``None`` means malformed configuration and
+        is deliberately handled fail-closed by :meth:`_discord_channel_route`.
+        """
+        raw = self._gate_raw("channel_routing", "DISCORD_CHANNEL_ROUTING")
+        if raw is None or raw == "":
+            return {}
+        if isinstance(raw, dict):
+            return raw
+        if isinstance(raw, str):
+            try:
+                parsed = json.loads(raw)
+            except (TypeError, ValueError):
+                return None
+            return parsed if isinstance(parsed, dict) else None
+        return None
+
+    @staticmethod
+    def _discord_route_values(raw: Any) -> set[str]:
+        """Normalize route selectors without treating mappings as selectors."""
+        if raw is None or isinstance(raw, bool):
+            return set()
+        if isinstance(raw, (list, tuple, set, frozenset)):
+            values = set()
+            for part in raw:
+                values.update(DiscordAdapter._discord_route_values(part))
+            return values
+        return {part.strip().casefold() for part in str(raw).split(",") if part.strip()}
+
+    def _discord_guild_keys(self, message: Any) -> set[str]:
+        guild = getattr(message, "guild", None) or getattr(getattr(message, "channel", None), "guild", None)
+        if guild is None:
+            return set()
+        keys = set()
+        guild_id = getattr(guild, "id", None)
+        if guild_id is not None:
+            keys.add(str(guild_id).casefold())
+        guild_name = str(getattr(guild, "name", "") or "").strip()
+        if guild_name:
+            keys.add(guild_name.casefold())
+        return keys
+
+    def _discord_route_matches(self, message: Any, spec: Any) -> bool:
+        """Match a route spec against channel/thread and optional guild selectors."""
+        if isinstance(spec, dict):
+            channel_values = set()
+            for key in ("channel", "channels", "channel_id", "channel_ids", "channel_name", "channel_names", "match"):
+                if key in spec:
+                    channel_values.update(self._discord_route_values(spec[key]))
+            guild_values = set()
+            for key in ("guild", "guilds", "guild_id", "guild_ids", "guild_name", "guild_names"):
+                if key in spec:
+                    guild_values.update(self._discord_route_values(spec[key]))
+            if not channel_values and not guild_values:
+                return False
+            if channel_values:
+                channel_keys = {
+                    value.casefold()
+                    for value in self._discord_channel_keys(
+                        message, self._get_parent_channel_id(getattr(message, "channel", None))
+                    )
+                }
+                if "*" not in channel_values and not (channel_keys & channel_values):
+                    return False
+            if guild_values:
+                guild_keys = self._discord_guild_keys(message)
+                if "*" not in guild_values and not (guild_keys & guild_values):
+                    return False
+            return True
+        selectors = self._discord_route_values(spec)
+        if "*" in selectors:
+            return True
+        channel_keys = {
+            value.casefold()
+            for value in self._discord_channel_keys(
+                message, self._get_parent_channel_id(getattr(message, "channel", None))
+            )
+        }
+        return bool(channel_keys & selectors)
+
+    def _discord_channel_route(self, message: Any) -> str:
+        """Resolve the legacy channel route before LLM dispatch.
+
+        Routes are intentionally local to the Discord adapter. Supported config forms are either
+        ``routes: {nashi_accept: [...]}``, ``channels: {channel: nashi_accept}``, or the same
+        route names directly under ``channel_routing``. Multiple matches are fail-closed.
+        """
+        config = self._discord_channel_routing_config()
+        if config is None:
+            logger.warning("[%s] Invalid Discord channel routing configuration; dropping", self.name)
+            return "route_conflict"
+
+        guild_config = config.get("guilds") if isinstance(config.get("guilds"), dict) else {}
+        allowed_guilds = config.get("allowed_guilds", guild_config.get("allow"))
+        denied_guilds = config.get("denied_guilds", guild_config.get("deny"))
+        guild_keys = self._discord_guild_keys(message)
+        allowed = self._discord_route_values(allowed_guilds)
+        denied = self._discord_route_values(denied_guilds)
+        if allowed and "*" not in allowed and not (guild_keys & allowed):
+            return "guild_drop"
+        if denied and ("*" in denied or guild_keys & denied):
+            return "guild_drop"
+
+        route_names = set(_DISCORD_CHANNEL_ROUTES)
+        route_specs = []
+        routes = config.get("routes")
+        if routes is None:
+            routes = config.get("channels")
+        if routes is not None:
+            if not isinstance(routes, dict):
+                return "route_conflict"
+            for name, spec in routes.items():
+                route_name = str(name).strip()
+                if route_name in route_names:
+                    route_specs.append((route_name, spec))
+                elif str(spec).strip() in route_names:
+                    # Also accept the compact inverse: {"channel-id": "nashi_accept"}.
+                    route_specs.append((str(spec).strip(), name))
+                else:
+                    return "route_conflict"
+        for route_name in route_names:
+            if route_name in config and route_name not in {"routes", "channels"}:
+                route_specs.append((route_name, config[route_name]))
+
+        matches = [name for name, spec in route_specs if self._discord_route_matches(message, spec)]
+        if len(matches) > 1:
+            return "route_conflict"
+        return matches[0] if matches else "accept"
+
+    def _handoff_channel_passes_channel_policy(self, message: Any) -> bool:
+        """Honor existing allow/ignore channel gates for the dedicated bridge channel."""
+        parent_id = self._get_parent_channel_id(getattr(message, "channel", None))
+        channel_keys = self._discord_channel_keys(message, parent_id)
+        allowed = self._get_allowed_channels()
+        if allowed and "*" not in allowed and not (channel_keys & allowed):
+            return False
+        ignored = self._get_ignored_channels()
+        return not ("*" in ignored or bool(channel_keys & ignored))
+
+    def _parse_discord_handoff(self, message: Any) -> Optional[OpsHandoff]:
+        """Parse a candidate message without widening admission for any other bot."""
+        if not self._is_discord_handoff_channel(message):
+            return None
+        author = getattr(message, "author", None)
+        if not getattr(author, "bot", False):
+            return None
+        if str(getattr(author, "id", "") or "") != self._hatsugarasu_bot_user_id():
+            return None
+        return parse_ops_handoff(getattr(message, "content", ""))
+
+    def is_trusted_handoff_source(self, source: Any) -> bool:
+        """Re-check adapter-owned source fields before central authz grants the bridge event."""
+        if getattr(source, "platform", None) != Platform.DISCORD:
+            return False
+        if getattr(source, "is_bot", False) is not True:
+            return False
+        if str(getattr(source, "user_id", "") or "") != self._hatsugarasu_bot_user_id():
+            return False
+        return str(
+            getattr(source, "parent_chat_id", None) or getattr(source, "chat_id", "") or ""
+        ) == self._discord_handoff_channel_id()
+
+    @staticmethod
+    def _handoff_agent_prompt(handoff: OpsHandoff) -> str:
+        return build_ops_execution_prompt(handoff)
+
     def _discord_free_response_channels(self) -> set:
         """Channel IDs/names needing no mention; a lone "*" is preserved for wildcard short-circuit."""
         raw = self.config.extra.get("free_response_channels")
@@ -5629,8 +5877,21 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
 
     async def _handle_message(
         self, message: DiscordMessage, role_authorized: bool = False, *, recovered: bool = False,
+        handoff: Optional[OpsHandoff] = None,
     ) -> bool:
         """Handle one Discord message and report whether it reached dispatch."""
+        if handoff is None:
+            handoff = self._parse_discord_handoff(message)
+        is_handoff = handoff is not None
+        channel_route = self._discord_channel_route(message)
+        if not is_handoff and channel_route in {"guild_drop", *_DISCORD_CHANNEL_ROUTE_DROPS}:
+            logger.info(
+                "[%s] Dropping Discord message before LLM: route=%s",
+                self.name,
+                channel_route,
+            )
+            return False
+        native_self_mention = self._self_is_explicitly_mentioned(message)
         # Server channels (not DMs) require @mention unless free-response or an already-joined thread.
         #
         # Config (discord.* in config.yaml or DISCORD_* env vars):
@@ -5661,7 +5922,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             if snapshot_text_parts and not raw_content:
                 raw_content = "\n".join(snapshot_text_parts)
                 normalized_content = raw_content
-        if self._self_is_explicitly_mentioned(message):
+        if native_self_mention:
             mention_prefix = True
             if self._client.user:
                 normalized_content = normalized_content.replace(f"<@{self._client.user.id}>", "").strip()
@@ -5691,16 +5952,17 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 "*" in free_channels
                 or bool(channel_keys & free_channels)
                 or is_voice_linked_channel
+                or channel_route == "nashi_accept"
             )
             in_bot_thread = self._in_bot_thread(message)
-            if require_mention and not is_free_channel and not in_bot_thread:
+            if require_mention and not is_free_channel and not in_bot_thread and not is_handoff:
                 if not self._self_is_explicitly_mentioned(message) and not mention_prefix:
                     return False
         # Auto-thread: isolate each @mention in a text channel into its own thread (Slack-style).
         auto_threaded_channel = None
         if not is_thread and not isinstance(message.channel, discord.DMChannel):
             no_thread_channels = self._get_no_thread_channels()
-            skip_thread = bool(channel_keys & no_thread_channels) or is_free_channel
+            skip_thread = bool(channel_keys & no_thread_channels) or is_free_channel or is_handoff
             auto_thread = os.getenv("DISCORD_AUTO_THREAD", "true").lower() in {"true", "1", "yes"}
             is_reply_message = getattr(message, "type", None) == discord.MessageType.reply
             if auto_thread and not skip_thread and not is_voice_linked_channel and not is_reply_message:
@@ -5771,6 +6033,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             parent_chat_id=parent_channel_id,
             message_id=str(message.id),
             role_authorized=role_authorized,
+            trusted_discord_handoff=is_handoff,
             auto_thread_created=auto_threaded_channel is not None,
             auto_thread_initial_name=(
                 getattr(auto_threaded_channel, "_hermes_auto_thread_initial_name", None)
@@ -5778,7 +6041,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             ) if auto_threaded_channel is not None else None,
         )
         media_urls, media_types, pending_text_injection = await self._collect_attachment_media(all_attachments)
-        event_text = normalized_content
+        event_text = self._handoff_agent_prompt(handoff) if is_handoff else normalized_content
         if pending_text_injection:
             event_text = f"{pending_text_injection}\n\n{event_text}" if event_text else pending_text_injection
         # ── History backfill ─────────────────────────────────────────
@@ -5790,9 +6053,9 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         if not _is_dm and self._discord_history_backfill():
             # Backfill on a gap: mention-gated channels, any thread (processing/restart gaps), any
             # reply (hydrate context around the referenced message). DMs/fresh auto-threads: nothing.
-            _has_mention_gap = require_mention and not is_free_channel and not in_bot_thread
+            _has_mention_gap = require_mention and not is_free_channel and not in_bot_thread and not is_handoff
             _is_reply = message.reference is not None
-            if (_has_mention_gap or is_thread or _is_reply) and auto_threaded_channel is None:
+            if (_has_mention_gap or is_thread or _is_reply) and auto_threaded_channel is None and not is_handoff:
                 _backfill_text = await self._fetch_channel_context(
                     message.channel, before=message,
                     reply_target=self._reply_target(message.reference) if _is_reply else None,
@@ -5821,12 +6084,18 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             reply_to_id = str(message.reference.message_id)
             if message.reference.resolved:
                 reply_to_text = getattr(message.reference.resolved, "content", None) or None
+        event_metadata = {}
+        if native_self_mention:
+            event_metadata["discord_native_self_mention"] = True
+        if is_handoff:
+            event_metadata["discord_handoff"] = {"handoff_id": handoff.handoff_id}
         event = MessageEvent(
             text=event_text, message_type=msg_type, source=source, raw_message=message,
             message_id=str(message.id), media_urls=media_urls, media_types=media_types,
             reply_to_message_id=reply_to_id, reply_to_text=reply_to_text,
             timestamp=message.created_at, auto_skill=_skills, channel_prompt=_channel_prompt,
             channel_context=_channel_context,
+            metadata=event_metadata,
         )
         # Track participation so follow-ups in this thread don't need @mention.
         if thread_id:
@@ -6984,6 +7253,18 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
     _gate("ignored_channels", "DISCORD_IGNORED_CHANNELS", from_platform_extra=False)
     _gate("allowed_channels", "DISCORD_ALLOWED_CHANNELS", from_platform_extra=False)
     _gate("no_thread_channels", "DISCORD_NO_THREAD_CHANNELS", from_platform_extra=False)
+    _gate("handoff_channel_id", "DISCORD_HANDOFF_CHANNEL_ID", from_platform_extra=True)
+    _gate("hatsugarasu_bot_user_id", "HATSUGARASU_BOT_USER_ID", from_platform_extra=True)
+    # Preserve the runtime's small channel-routing policy in adapter-local config. Mappings stay
+    # structured in PlatformConfig.extra; JSON strings are also accepted for env-only deployments.
+    channel_routing_cfg = (
+        discord_cfg["channel_routing"] if "channel_routing" in discord_cfg
+        else platform_extra_cfg.get("channel_routing")
+    )
+    if channel_routing_cfg is not None:
+        seeded_extra["channel_routing"] = channel_routing_cfg
+        if isinstance(channel_routing_cfg, str):
+            _env_default("DISCORD_CHANNEL_ROUTING", channel_routing_cfg)
     # history_backfill: recover mention-gated channel messages between bot turns.
     if "history_backfill" in discord_cfg:
         _env_default("DISCORD_HISTORY_BACKFILL", str(discord_cfg["history_backfill"]).lower())
