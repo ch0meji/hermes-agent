@@ -1,0 +1,104 @@
+name: Custom Hermes Image
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: "Target Docker platform (verify against hermes-prod before deploy)"
+        required: true
+        default: linux/amd64
+        type: choice
+        options:
+          - linux/amd64
+          - linux/arm64
+
+# This workflow deliberately publishes only one platform per run. The existing
+# official image manifest is amd64+arm64, but hermes-prod's host architecture is
+# not visible from this development environment. Main pushes use amd64; an
+# explicit arm64 dispatch is available once Ops confirms the host platform.
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: custom-image-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE_NAME: ghcr.io/ch0meji/hermes-agent
+  TARGET_PLATFORM: ${{ inputs.platform || 'linux/amd64' }}
+
+jobs:
+  publish:
+    name: Build and publish custom image
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out trusted main
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        id: build
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        with:
+          context: .
+          file: Dockerfile
+          platforms: ${{ env.TARGET_PLATFORM }}
+          push: true
+          tags: |
+            ${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
+            ${{ env.IMAGE_NAME }}:latest
+          labels: |
+            org.opencontainers.image.source=https://github.com/ch0meji/hermes-agent
+            org.opencontainers.image.revision=${{ github.sha }}
+          build-args: |
+            HERMES_GIT_SHA=${{ github.sha }}
+
+      - name: Pull published image for smoke validation
+        run: docker pull "${IMAGE_NAME}:sha-${GITHUB_SHA}"
+
+      - name: Verify build provenance and imports
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          actual_sha="$(docker run --rm --entrypoint cat "${IMAGE_NAME}:sha-${GITHUB_SHA}" /opt/hermes/.hermes_build_sha)"
+          test "${actual_sha}" = "${EXPECTED_SHA}"
+          docker run --rm --entrypoint /opt/hermes/.venv/bin/python "${IMAGE_NAME}:sha-${GITHUB_SHA}" -c '
+          import gateway.run_inbound
+          import plugins.platforms.discord.adapter
+          import plugins.platforms.discord.handoff
+          from hermes_cli.build_info import get_build_sha
+          assert get_build_sha(short=0) == "'"${EXPECTED_SHA}"'"
+          print("imports: OK")
+          print(f"build_sha: {get_build_sha(short=0)}")
+          '
+
+      - name: Verify Hermes CLI startup
+        run: docker run --rm --entrypoint /opt/hermes/.venv/bin/hermes "${IMAGE_NAME}:sha-${GITHUB_SHA}" --version
+
+      - name: Write published digest summary
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          {
+            echo "### Custom Hermes image"
+            echo "- image: ${IMAGE_NAME}"
+            echo "- platform: ${TARGET_PLATFORM}"
+            echo "- tag: sha-${GITHUB_SHA}"
+            echo "- digest: ${IMAGE_DIGEST}"
+            echo "- build SHA: ${GITHUB_SHA}"
+          } >> "${GITHUB_STEP_SUMMARY}"
