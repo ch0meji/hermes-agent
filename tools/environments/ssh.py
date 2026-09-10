@@ -56,9 +56,10 @@ class SSHEnvironment(BaseEnvironment):
 
     def __init__(self, host: str, user: str, cwd: str = "~",
                  timeout: int = 60, port: int = 22, key_path: str = "",
-                 probe_only: bool = False):
+                 probe_only: bool = False, read_only: bool = False):
         super().__init__(cwd=cwd, timeout=timeout)
         self.host, self.user, self.port, self.key_path = host, user, port, key_path
+        self.read_only = bool(read_only)
         self.control_dir = Path(tempfile.gettempdir()) / "hermes-ssh"
         self.control_dir.mkdir(parents=True, exist_ok=True)
         # Short, deterministic socket name: the path must stay under macOS's 104-byte sun_path
@@ -68,9 +69,17 @@ class SSHEnvironment(BaseEnvironment):
         socket_key = f"{user}@{host}:{port}"
         if probe_only:
             socket_key = f"{socket_key}:probe:{self._session_id}"
+        elif self.read_only:
+            socket_key = f"{socket_key}:read-only:{self._session_id}"
         _socket_id = hashlib.sha256(socket_key.encode()).hexdigest()[:16]
         self.control_socket = self.control_dir / f"{_socket_id}.sock"
         _ensure_ssh_available()
+        # Read-only handoffs deliberately skip the connection echo and every
+        # remote setup/sync operation. The requested command is the first and
+        # only SSH operation, with known-host verification enforced below.
+        if self.read_only:
+            self._sync_manager = None
+            return
         self._establish_connection()
         if probe_only:
             self._sync_manager = None
@@ -110,10 +119,11 @@ class SSHEnvironment(BaseEnvironment):
     def _build_ssh_command(self, extra_args: list | None = None, send_env: Iterable[str] = ()) -> list:
         send_env = tuple(sorted(send_env))
         cmd = ["ssh"]
-        if _SSH_MULTIPLEX:
+        if _SSH_MULTIPLEX and not self.read_only:
             cmd.extend(["-o", f"ControlPath={self._control_socket_for(send_env)}",
                         "-o", "ControlMaster=auto", "-o", "ControlPersist=300"])
-        cmd.extend(["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=10"])
+        strict_host_key = "yes" if self.read_only else "accept-new"
+        cmd.extend(["-o", "BatchMode=yes", f"-o", f"StrictHostKeyChecking={strict_host_key}", "-o", "ConnectTimeout=10"])
         # Names only; values ride the ssh client's own environment (never the remote command text).
         cmd.extend(arg for name in send_env for arg in ("-o", f"SendEnv={name}"))
         cmd.extend(self._target_flags("-p"))

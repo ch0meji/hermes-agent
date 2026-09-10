@@ -344,6 +344,8 @@ DEFAULT_CONFIG = {
         # Keep a long-lived bash shell across execute() calls so cwd/env/shell variables survive.
         # Applies to non-local backends (SSH); local is opt-in via TERMINAL_LOCAL_PERSISTENT env.
         "persistent_shell": True,
+        # SSH read-only handoffs use one direct command, skip setup/sync, and require known hosts.
+        "ssh_read_only": False,
     },
 
     "web": {

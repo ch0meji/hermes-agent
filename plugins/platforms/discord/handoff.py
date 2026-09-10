@@ -22,6 +22,22 @@ MAX_RESULT_TEXT_LENGTH = 1500
 
 _HANDOFF_ID_RE = re.compile(r"^H-[A-Za-z0-9][A-Za-z0-9-]*$")
 _FIELD_RE = re.compile(r"^([a-z][a-z_]*)\s*:\s*(.*)$", re.IGNORECASE)
+_RESULT_STATUS_RE = re.compile(
+    r"(?:^\s*[-*]?\s*status\s*:\s*|[\"']status[\"']\s*:\s*[\"']?)"
+    r"(success|blocked|failure)\b",
+    re.IGNORECASE | re.MULTILINE,
+)
+_RESULT_REASON_RE = re.compile(
+    r"(?:^\s*[-*]?\s*reason\s*:\s*|[\"']reason[\"']\s*:\s*[\"']?)"
+    r"([A-Za-z0-9_.-]+)\b",
+    re.IGNORECASE | re.MULTILINE,
+)
+_READ_ONLY_REQUEST_RE = re.compile(r"(?:\buptime\b|\bssh\b|read[- ]only|known[- ]host)", re.IGNORECASE)
+_WRITE_REQUEST_RE = re.compile(
+    r"(?:\brestart\b|\breboot\b|\bshutdown\b|\bdelete\b|\bremove\b|"
+    r"\binstall\b|\bdeploy\b|\bmodify\b|\bwrite\b|\brm\b|\bsudo\b)",
+    re.IGNORECASE,
+)
 _ALLOWED_FIELDS = {"type", "handoff_id", "from", "to", "repo", "ref", "commit"}
 
 
@@ -124,6 +140,26 @@ def parse_ops_handoff(content: object) -> Optional[OpsHandoff]:
     )
 
 
+def is_read_only_ssh_request(request: object) -> bool:
+    """Return whether a handoff looks like an informational SSH request.
+
+    This is only a prompt-policy hint; command safety is enforced independently
+    by the terminal approval detector and SSH backend.
+    """
+    text = str(request or "")
+    return bool(_READ_ONLY_REQUEST_RE.search(text) and not _WRITE_REQUEST_RE.search(text))
+
+
+def extract_ops_result_metadata(result: object) -> tuple[Optional[str], Optional[str]]:
+    """Extract structured status/reason fields from an agent or terminal result."""
+    text = str(result or "")
+    status_match = _RESULT_STATUS_RE.search(text)
+    status = status_match.group(1).lower() if status_match else None
+    reason_match = _RESULT_REASON_RE.search(text) if status == "blocked" else None
+    reason = reason_match.group(1) if reason_match else None
+    return status, reason
+
+
 def build_ops_execution_prompt(handoff: OpsHandoff) -> str:
     """Turn a parsed handoff into a bounded prompt for the existing Hermes agent."""
     metadata = []
@@ -133,22 +169,47 @@ def build_ops_execution_prompt(handoff: OpsHandoff) -> str:
     context = "\n".join(metadata)
     if context:
         context = f"\n{context}"
+    if is_read_only_ssh_request(handoff.request):
+        execution_rules = (
+            "This is an informational read-only SSH request. Use the configured SSH backend or one "
+            "simple direct SSH invocation to the already-known host, and run only the requested "
+            "read-only command. Do not run a TCP/port preflight, `nc`, `nmap`, `/dev/tcp`, "
+            "`ssh-keyscan`, shell pipelines, or write/destructive commands. If strict known-host "
+            "verification fails, stop and report a blocked result with reason `known_host_required`."
+        )
+    else:
+        execution_rules = (
+            "Execute the following request with Hermes' existing Ops capabilities. Follow the normal "
+            "safety rules for destructive or dangerous actions."
+        )
     return (
         "[Trusted Discord Ops handoff]\n"
         f"handoff_id: {handoff.handoff_id}{context}\n\n"
-        "Execute the following request with Hermes' existing Ops capabilities. Follow the normal "
-        "safety rules for destructive or dangerous actions. Return only a concise factual result; "
-        "do not include credentials, tokens, full command output, full logs, or internal reasoning.\n"
+        f"{execution_rules} Return a concise factual result using `status: success`, "
+        "`status: blocked`, or `status: failure`; for blocked results include a machine-readable "
+        "`reason:`. Do not include credentials, tokens, full command output, full logs, or internal reasoning.\n"
         "request:\n"
         f"{handoff.request}"
     )
 
 
-def format_ops_result(handoff_id: str, result: object, *, success: bool = True) -> str:
-    """Build a Discord-safe result while preserving the incoming correlation ID."""
+def format_ops_result(
+    handoff_id: str,
+    result: object,
+    *,
+    success: bool = True,
+    status: Optional[str] = None,
+    reason: Optional[str] = None,
+) -> str:
+    """Build a Discord-safe result while preserving correlation ID and status."""
     from agent.redact import redact_sensitive_text
 
-    status = "success" if success else "failure"
+    status = (status or ("success" if success else "failure")).strip().lower()
+    if status not in {"success", "blocked", "failure"}:
+        raise ValueError(f"unsupported ops result status: {status!r}")
+    reason = _clean_line(reason, 120) if reason else ""
+    if status != "blocked":
+        reason = ""
     body = redact_sensitive_text(str(result or "").strip(), force=True, redact_url_credentials=True)
     body = body.replace("\x00", " ").strip()
     if len(body) > MAX_RESULT_TEXT_LENGTH:
@@ -163,6 +224,7 @@ def format_ops_result(handoff_id: str, result: object, *, success: bool = True) 
         "to: codex\n\n"
         "result:\n"
         f"- status: {status}\n"
+        + (f"- reason: {reason}\n" if reason else "")
         + "\n".join(f"- {line}" for line in body.splitlines())
     )
     return formatted[:MAX_HANDOFF_MESSAGE_CHARS]

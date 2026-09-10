@@ -12,6 +12,8 @@ import shlex
 import tempfile
 import unicodedata
 
+from tools.read_only_ssh import is_read_only_ssh_command
+
 logger = logging.getLogger("tools.approval")
 
 # Sensitive write targets, matched via ~ / $HOME / $HERMES_HOME spellings. The resolved absolute

@@ -641,6 +641,9 @@ def _get_env_config() -> Dict[str, Any]:
         "ssh_user": _tenv("TERMINAL_SSH_USER", ""),
         "ssh_port": _parse_env_var("TERMINAL_SSH_PORT", "22"),
         "ssh_key": _tenv("TERMINAL_SSH_KEY", ""),
+        # Read-only SSH skips remote setup/sync and uses strict known-host
+        # verification; the command itself is the first SSH operation.
+        "ssh_read_only": _tenv_bool("TERMINAL_SSH_READ_ONLY", "false"),
         # Persistent shell: SSH defaults to the config-level persistent_shell
         # setting; local is always opt-in. Per-backend env vars override.
         "ssh_persistent": _tenv_bool(
@@ -857,7 +860,8 @@ def _run_approval_guards(command: str, env_type: str, config: Dict[str, Any], *,
             f"Command denied: {desc}. "
             "Use the approval prompt to allow it, or rephrase the command."
         )
-        raise _Rejected(_error_json(approval.get("message", fallback_msg), status="blocked"))
+        extra = {"reason": "approval_timeout"} if approval.get("outcome") == "timeout" else {}
+        raise _Rejected(_error_json(approval.get("message", fallback_msg), status="blocked", **extra))
     desc = approval.get("description", "flagged as dangerous")
     if approval.get("user_approved"):
         return _ApprovalVerdict(

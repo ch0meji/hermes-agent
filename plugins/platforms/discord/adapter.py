@@ -35,6 +35,7 @@ from plugins.platforms.discord.handoff import (
     HandoffDedupe,
     OpsHandoff,
     build_ops_execution_prompt,
+    extract_ops_result_metadata,
     format_ops_result,
     parse_ops_handoff,
 )
@@ -1028,7 +1029,8 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         handoff_id = handoff.get("handoff_id") if isinstance(handoff, dict) else None
         if not handoff_id:
             return response
-        return format_ops_result(handoff_id, response)
+        status, reason = extract_ops_result_metadata(response)
+        return format_ops_result(handoff_id, response, status=status, reason=reason)
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.DISCORD)

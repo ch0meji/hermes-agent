@@ -798,8 +798,9 @@ _BACKEND_FALLBACK_DESCRIPTIONS: dict[str, str] = {
     "ssh": "a remote host reached over SSH (likely Linux)",
 }
 
-# Per-process probe cache keyed by (env_type, cwd_hint) so a mid-process backend switch rebuilds.
-_BACKEND_PROBE_CACHE: dict[tuple[str, str], str] = {}
+# Per-process probe cache keyed by (env_type, cwd_hint, read_only) so a backend/policy switch
+# cannot reuse a network-derived hint from another mode.
+_BACKEND_PROBE_CACHE: dict[tuple[str, str, bool], str] = {}
 
 
 def _plugin_backend_attr(backend: str, attr: str, default=None):
@@ -876,6 +877,10 @@ def _run_backend_probe(env_type: str, terminal_tool) -> str:
     from tools.terminal_tool_lifecycle import _cleanup_env
 
     config = terminal_tool._get_env_config()
+    # Read-only SSH handoffs must not perform a prompt-time network probe. The
+    # actual direct command is the first SSH operation and uses known-host mode.
+    if env_type == "ssh" and config.get("ssh_read_only"):
+        return ""
     # Same container_config shaper as the live terminal path: a private copy of the key table here
     # drifted (no docker_network) and gave the probe a bridge-networked container under lockdown.
     env = _create_environment(
@@ -918,7 +923,11 @@ def _format_backend_probe(output: str) -> str:
 
 def _probe_remote_backend(env_type: str) -> str | None:
     """Describe the active non-local backend via a live probe; None if it failed (cached, failures included)."""
-    cache_key = (env_type, _tenv_read("TERMINAL_CWD", ""))
+    cache_key = (
+        env_type,
+        _tenv_read("TERMINAL_CWD", ""),
+        _tenv_read("TERMINAL_SSH_READ_ONLY", "").strip().lower() in {"1", "true", "yes"},
+    )
     formatted = _BACKEND_PROBE_CACHE.get(cache_key)
     if formatted is None:
         formatted = ""
