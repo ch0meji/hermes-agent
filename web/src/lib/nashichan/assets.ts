@@ -1,20 +1,29 @@
 import type { NashichanState } from "./types";
 
-const ASSET_ROOT = "/assets/nashichan";
+export const NASHICHAN_SPRITE = "/assets/nashichan/nashichan-sprite.webp";
 
-export const NASHICHAN_ASSETS: Record<NashichanState, string> = {
-  idle: `${ASSET_ROOT}/idle.png`,
-  greeting: `${ASSET_ROOT}/greeting.png`,
-  listening: `${ASSET_ROOT}/listening.png`,
-  thinking: `${ASSET_ROOT}/thinking.png`,
-  working: `${ASSET_ROOT}/working.png`,
-  approval: `${ASSET_ROOT}/approval.png`,
-  success: `${ASSET_ROOT}/success.png`,
-  celebrate: `${ASSET_ROOT}/celebrate.png`,
-  warning: `${ASSET_ROOT}/warning.png`,
-  error: `${ASSET_ROOT}/error.png`,
-  offline: `${ASSET_ROOT}/offline.png`,
-  security: `${ASSET_ROOT}/security.png`,
-  update: `${ASSET_ROOT}/update.png`,
-  sleep: `${ASSET_ROOT}/sleep.png`,
+export interface NashichanSpriteCell {
+  column: number;
+  row: number;
+}
+
+/**
+ * 4x4 sprite coordinates. Keeping every approved state in one binary asset
+ * avoids fourteen independent image requests and keeps state artwork atomic.
+ */
+export const NASHICHAN_SPRITE_CELLS: Record<NashichanState, NashichanSpriteCell> = {
+  idle: { column: 0, row: 0 },
+  greeting: { column: 1, row: 0 },
+  listening: { column: 2, row: 0 },
+  thinking: { column: 3, row: 0 },
+  working: { column: 0, row: 1 },
+  approval: { column: 1, row: 1 },
+  success: { column: 2, row: 1 },
+  celebrate: { column: 3, row: 1 },
+  warning: { column: 0, row: 2 },
+  error: { column: 1, row: 2 },
+  offline: { column: 2, row: 2 },
+  security: { column: 3, row: 2 },
+  update: { column: 0, row: 3 },
+  sleep: { column: 1, row: 3 },
 };
