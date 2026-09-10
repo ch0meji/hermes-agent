@@ -1,29 +1,24 @@
 import type { NashichanState } from "./types";
 
-export const NASHICHAN_SPRITE = "/assets/nashichan/nashichan-sprite.webp";
-
-export interface NashichanSpriteCell {
-  column: number;
-  row: number;
-}
-
 /**
- * 4x4 sprite coordinates. Keeping every approved state in one binary asset
- * avoids fourteen independent image requests and keeps state artwork atomic.
+ * Presentation-only artwork for each Nashichan state.
+ *
+ * Keep each state as an independent asset so one malformed image cannot make
+ * every mascot state unavailable.
  */
-export const NASHICHAN_SPRITE_CELLS: Record<NashichanState, NashichanSpriteCell> = {
-  idle: { column: 0, row: 0 },
-  greeting: { column: 1, row: 0 },
-  listening: { column: 2, row: 0 },
-  thinking: { column: 3, row: 0 },
-  working: { column: 0, row: 1 },
-  approval: { column: 1, row: 1 },
-  success: { column: 2, row: 1 },
-  celebrate: { column: 3, row: 1 },
-  warning: { column: 0, row: 2 },
-  error: { column: 1, row: 2 },
-  offline: { column: 2, row: 2 },
-  security: { column: 3, row: 2 },
-  update: { column: 0, row: 3 },
-  sleep: { column: 1, row: 3 },
+export const NASHICHAN_ASSETS: Record<NashichanState, string> = {
+  idle: "/assets/nashichan/idle.webp",
+  greeting: "/assets/nashichan/greeting.webp",
+  listening: "/assets/nashichan/listening.webp",
+  thinking: "/assets/nashichan/thinking.webp",
+  working: "/assets/nashichan/working.webp",
+  approval: "/assets/nashichan/approval.webp",
+  success: "/assets/nashichan/success.webp",
+  celebrate: "/assets/nashichan/celebrate.webp",
+  warning: "/assets/nashichan/warning.webp",
+  error: "/assets/nashichan/error.webp",
+  offline: "/assets/nashichan/offline.webp",
+  security: "/assets/nashichan/security.webp",
+  update: "/assets/nashichan/update.webp",
+  sleep: "/assets/nashichan/sleep.webp",
 };

@@ -1,9 +1,6 @@
 import { useState } from "react";
 
-import {
-  NASHICHAN_SPRITE,
-  NASHICHAN_SPRITE_CELLS,
-} from "@/lib/nashichan/assets";
+import { NASHICHAN_ASSETS } from "@/lib/nashichan/assets";
 import type { NashichanState } from "@/lib/nashichan/types";
 import { cn } from "@/lib/utils";
 
@@ -13,10 +10,10 @@ interface NashichanAvatarProps {
 }
 
 export function NashichanAvatar({ state, className }: NashichanAvatarProps) {
-  const [failed, setFailed] = useState(false);
-  const { column, row } = NASHICHAN_SPRITE_CELLS[state];
+  const src = NASHICHAN_ASSETS[state];
+  const [failedSrc, setFailedSrc] = useState<string | null>(null);
 
-  if (failed) return null;
+  if (failedSrc === src) return null;
 
   return (
     <div
@@ -28,15 +25,12 @@ export function NashichanAvatar({ state, className }: NashichanAvatarProps) {
       )}
     >
       <img
-        src={NASHICHAN_SPRITE}
+        src={src}
         alt=""
         aria-hidden="true"
         draggable={false}
-        onError={() => setFailed(true)}
-        className="pointer-events-none absolute left-0 top-0 h-[400%] w-[400%] max-w-none select-none"
-        style={{
-          transform: `translate(${-column * 25}%, ${-row * 25}%)`,
-        }}
+        onError={() => setFailedSrc(src)}
+        className="pointer-events-none h-full w-full select-none object-contain"
       />
     </div>
   );

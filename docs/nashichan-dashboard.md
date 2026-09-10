@@ -35,24 +35,29 @@ The integration deliberately reuses the existing `/api/events?channel=...` WebSo
 
 ## Artwork
 
-The dashboard ships one runtime sprite assembled from the approved individual images:
+The dashboard ships fourteen independent WebP assets, one per visual state:
 
 ```text
-web/public/assets/nashichan/nashichan-sprite.webp
+web/public/assets/nashichan/
+  idle.webp
+  greeting.webp
+  listening.webp
+  thinking.webp
+  working.webp
+  approval.webp
+  success.webp
+  celebrate.webp
+  warning.webp
+  error.webp
+  offline.webp
+  security.webp
+  update.webp
+  sleep.webp
 ```
 
-The 4x4 grid layout is:
+`web/src/lib/nashichan/assets.ts` owns the state-to-asset mapping. The dashboard intentionally does not use a sprite sheet: keeping states independent limits a malformed or missing image to that state instead of making the entire mascot unavailable.
 
-```text
-idle       greeting   listening   thinking
-working    approval   success     celebrate
-warning    error      offline     security
-update     sleep      (empty)     (empty)
-```
-
-The source/archival pack can remain as fourteen individual PNGs. The runtime sprite is only a packaging optimization: it was assembled from those approved assets without redrawing the character. `web/src/lib/nashichan/assets.ts` owns the state-to-cell mapping.
-
-Artwork remains decoupled from behavior. Missing or broken artwork is non-fatal: the image component hides itself rather than affecting Chat.
+Artwork remains decoupled from behavior. Missing or broken artwork is non-fatal: the affected image hides itself rather than affecting Chat. The approved character artwork must remain visually faithful to Nashichan; AI/server identity belongs in surrounding UI rather than redesigning the character.
 
 ## UI behavior
 
@@ -71,12 +76,14 @@ npm run build -w web
 
 Also verify manually:
 
-1. Chat remains usable when the Nashichan sprite is absent.
-2. The mascot does not intercept mouse/touch input.
-3. Desktop and narrow/mobile layouts do not cover critical controls.
-4. Tool events switch to `working`; model activity switches to `thinking`.
-5. Completion briefly shows `success` then returns to `idle`.
-6. Event-feed or sidecar failures show `offline` without breaking the PTY chat.
+1. All fourteen state images load from `/assets/nashichan/<state>.webp`.
+2. Chat remains usable when one Nashichan image is absent or malformed.
+3. The mascot does not intercept mouse/touch input.
+4. Desktop and narrow/mobile layouts do not cover critical controls.
+5. Tool events switch to `working`; model activity switches to `thinking`.
+6. Completion briefly shows `success` then returns to `idle`.
+7. Approval/security events map to their dedicated states.
+8. Event-feed or sidecar failures show `offline` without breaking the PTY chat.
 
 ### CI startup failures
 

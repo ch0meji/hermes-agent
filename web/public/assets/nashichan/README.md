@@ -1,20 +1,26 @@
 # Nashichan dashboard assets
 
-The Hermes dashboard uses one approved-artwork sprite sheet at runtime:
-
-- `nashichan-sprite.webp`
-
-The sheet is a 4x4 grid containing the fourteen approved states in this order:
+The Hermes dashboard uses fourteen independent approved-artwork WebP files at runtime, one for each Nashichan state:
 
 ```text
-idle       greeting   listening   thinking
-working    approval   success     celebrate
-warning    error      offline     security
-update     sleep      (empty)     (empty)
+idle.webp
+greeting.webp
+listening.webp
+thinking.webp
+working.webp
+approval.webp
+success.webp
+celebrate.webp
+warning.webp
+error.webp
+offline.webp
+security.webp
+update.webp
+sleep.webp
 ```
 
-`web/src/lib/nashichan/assets.ts` owns the state-to-cell mapping. Keeping the artwork in one binary makes the state set atomic and avoids fourteen independent browser requests.
+`web/src/lib/nashichan/assets.ts` owns the state-to-file mapping. A sprite sheet is intentionally not used: an invalid or missing file must affect only that state, not every Nashichan state.
 
-The source/archival artwork may still be kept as individual PNG files outside the application bundle. The runtime sprite was assembled only from the approved images; no character redraw is involved.
+The runtime artwork comes from the approved character images without redesigning Nashichan. Character identity stays separate from Hermes; server/AI context belongs in the surrounding dashboard UI.
 
-The character UI is fail-safe: if the sprite cannot be loaded, the mascot image hides itself and Chat continues to work.
+The character UI is fail-safe: if an asset cannot be loaded, that mascot image hides itself and Chat continues to work.
