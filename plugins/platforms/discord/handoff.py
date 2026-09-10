@@ -32,6 +32,7 @@ _RESULT_REASON_RE = re.compile(
     r"([A-Za-z0-9_.-]+)\b",
     re.IGNORECASE | re.MULTILINE,
 )
+_RESULT_METADATA_LINE_RE = re.compile(r"^(?:status|reason)\s*:\s*\S+\s*$", re.IGNORECASE)
 _READ_ONLY_REQUEST_RE = re.compile(r"(?:\buptime\b|\bssh\b|read[- ]only|known[- ]host)", re.IGNORECASE)
 _WRITE_REQUEST_RE = re.compile(
     r"(?:\brestart\b|\breboot\b|\bshutdown\b|\bdelete\b|\bremove\b|"
@@ -193,6 +194,21 @@ def build_ops_execution_prompt(handoff: OpsHandoff) -> str:
     )
 
 
+def _normalize_result_body(body: str) -> str:
+    """Remove transport metadata and one Markdown bullet layer from agent output."""
+    lines: list[str] = []
+    for raw_line in body.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        line = re.sub(r"^[-*]\s+", "", line).strip()
+        if _RESULT_METADATA_LINE_RE.fullmatch(line):
+            continue
+        if line:
+            lines.append(line)
+    return "\n".join(lines)
+
+
 def format_ops_result(
     handoff_id: str,
     result: object,
@@ -211,7 +227,7 @@ def format_ops_result(
     if status != "blocked":
         reason = ""
     body = redact_sensitive_text(str(result or "").strip(), force=True, redact_url_credentials=True)
-    body = body.replace("\x00", " ").strip()
+    body = _normalize_result_body(body.replace("\x00", " ").strip())
     if len(body) > MAX_RESULT_TEXT_LENGTH:
         body = body[: MAX_RESULT_TEXT_LENGTH - 24].rstrip() + "\n…[truncated]"
     if not body:
