@@ -1,5 +1,3 @@
-import type { ConnectionState } from "@/lib/gatewayClient";
-
 export const NASHICHAN_STATES = [
   "idle",
   "greeting",
@@ -19,12 +17,24 @@ export const NASHICHAN_STATES = [
 
 export type NashichanState = (typeof NASHICHAN_STATES)[number];
 
+/**
+ * Stable presentation-facing connection contract. This intentionally mirrors
+ * the dashboard gateway lifecycle without coupling mascot code to a particular
+ * shared-package build artifact.
+ */
+export type NashichanConnectionState =
+  | "idle"
+  | "connecting"
+  | "open"
+  | "closed"
+  | "error";
+
 export interface HermesDashboardEvent {
   type?: string;
   payload?: unknown;
 }
 
 export interface NashichanConnectionInput {
-  state: ConnectionState;
+  state: NashichanConnectionState;
   hasError?: boolean;
 }
