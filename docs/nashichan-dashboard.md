@@ -35,29 +35,24 @@ The integration deliberately reuses the existing `/api/events?channel=...` WebSo
 
 ## Artwork
 
-Place the approved PNG asset pack under:
+The dashboard ships one runtime sprite assembled from the approved individual images:
 
 ```text
-web/public/assets/nashichan/
-  idle.png
-  greeting.png
-  listening.png
-  thinking.png
-  working.png
-  approval.png
-  success.png
-  celebrate.png
-  warning.png
-  error.png
-  offline.png
-  security.png
-  update.png
-  sleep.png
+web/public/assets/nashichan/nashichan-sprite.webp
 ```
 
-Artwork is intentionally decoupled from behavior. Replacing an image does not require changing the state machine.
+The 4x4 grid layout is:
 
-Missing or broken artwork is non-fatal: the image component hides itself rather than affecting Chat.
+```text
+idle       greeting   listening   thinking
+working    approval   success     celebrate
+warning    error      offline     security
+update     sleep      (empty)     (empty)
+```
+
+The source/archival pack can remain as fourteen individual PNGs. The runtime sprite is only a packaging optimization: it was assembled from those approved assets without redrawing the character. `web/src/lib/nashichan/assets.ts` owns the state-to-cell mapping.
+
+Artwork remains decoupled from behavior. Missing or broken artwork is non-fatal: the image component hides itself rather than affecting Chat.
 
 ## UI behavior
 
@@ -76,7 +71,7 @@ npm run build -w web
 
 Also verify manually:
 
-1. Chat remains usable when every Nashichan image is absent.
+1. Chat remains usable when the Nashichan sprite is absent.
 2. The mascot does not intercept mouse/touch input.
 3. Desktop and narrow/mobile layouts do not cover critical controls.
 4. Tool events switch to `working`; model activity switches to `thinking`.
