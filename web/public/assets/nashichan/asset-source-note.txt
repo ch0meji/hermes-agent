@@ -1,1 +1,0 @@
-Approved Nashichan artwork is bundled with the dashboard. Binary files are generated from the approved source pack; no redraw is performed.
