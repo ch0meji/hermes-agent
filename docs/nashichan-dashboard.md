@@ -77,3 +77,7 @@ Also verify manually:
 4. Tool events switch to `working`; model activity switches to `thinking`.
 5. Completion briefly shows `success` then returns to `idle`.
 6. Event-feed or sidecar failures show `offline` without breaking the PTY chat.
+
+### CI startup failures
+
+A failed orchestrator run with no dispatched jobs (`jobs: []`) is a workflow startup/infrastructure failure, not evidence that frontend checks failed. In that case, retrigger the PR workflow and confirm that the `JS & TS checks` lane actually starts before diagnosing Nashichan code. Do not weaken or edit repository-wide CI merely to bypass a zero-job startup failure.
