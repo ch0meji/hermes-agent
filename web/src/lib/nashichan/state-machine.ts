@@ -1,6 +1,4 @@
-import type { ConnectionState } from "@/lib/gatewayClient";
-
-import type { NashichanState } from "./types";
+import type { NashichanConnectionState, NashichanState } from "./types";
 
 export interface NashichanStateDecision {
   state: NashichanState;
@@ -23,7 +21,7 @@ function objectPayload(payload: unknown): Record<string, unknown> | null {
  * `null` means the connection itself should not replace the current activity state.
  */
 export function nashichanStateForConnection(
-  state: ConnectionState,
+  state: NashichanConnectionState,
   hasError = false,
 ): NashichanStateDecision | null {
   if (hasError || state === "closed" || state === "error") {
