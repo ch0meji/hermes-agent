@@ -1,3 +1,5 @@
+import os
+
 from . import adapter as _adapter
 from .mention_guard import targets_other_bot_only
 
@@ -12,6 +14,7 @@ def _discord_message_admission_with_hatsugarasu_guard(self, message, *, claim):
     if not getattr(author, "bot", False) and targets_other_bot_only(
         message,
         other_bot_user_id=self._hatsugarasu_bot_user_id(),
+        other_bot_role_id=os.getenv("HATSUGARASU_ROLE_ID", "1545458279021285500"),
         self_bot_user_id=str(getattr(client_user, "id", "") or ""),
     ):
         return False, False
