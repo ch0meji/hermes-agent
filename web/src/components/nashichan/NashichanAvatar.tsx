@@ -20,7 +20,7 @@ export function NashichanAvatar({ state, className }: NashichanAvatarProps) {
       role="img"
       aria-label={`ナシちゃん: ${state}`}
       className={cn(
-        "relative aspect-square w-[150px] shrink-0 overflow-hidden select-none sm:w-[190px] lg:w-[230px] xl:w-[260px]",
+        "relative aspect-square w-[96px] shrink-0 overflow-hidden select-none sm:w-[112px] lg:w-[128px] xl:w-[144px]",
         className,
       )}
     >
