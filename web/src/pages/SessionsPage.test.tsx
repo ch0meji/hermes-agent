@@ -52,6 +52,25 @@ function click(el: Element | null) {
 
 const button = (label: string) => document.querySelector(`button[aria-label="${label}"]`);
 
+const sessionId = "sid-guanli";
+const owningProfile = "guanli";
+const sessionRow = {
+  id: sessionId,
+  profile: owningProfile,
+  source: "cli",
+  model: null,
+  title: "Managed",
+  started_at: 1,
+  ended_at: null,
+  last_active: 1,
+  is_active: false,
+  message_count: 2,
+  tool_call_count: 0,
+  input_tokens: 1,
+  output_tokens: 1,
+  preview: "hi",
+};
+
 async function renderSessionsPage(rows: Record<string, unknown>[]) {
   // Page list uses limit 20; the overview tab's recent-cards fetch uses 50 —
   // keep the overview empty so the list view (with row actions) renders.
@@ -90,6 +109,10 @@ async function renderSessionsPage(rows: Record<string, unknown>[]) {
   await waitFor(() => Boolean(button("Delete session")));
 }
 
+async function renderOwnedSession() {
+  await renderSessionsPage([sessionRow]);
+}
+
 beforeEach(() => {
   for (const fn of Object.values(apiMocks)) fn.mockReset();
   apiMocks.getStatus.mockResolvedValue({});
@@ -119,19 +142,23 @@ afterEach(async () => {
 });
 
 describe("SessionsPage per-row profile routing (#99387)", () => {
-  it("sends every per-row request to the row's owning profile, not the management default", async () => {
-    await renderSessionsPage([
-      { id: "sid-guanli", profile: "guanli", source: "cli", model: null, title: "Managed", started_at: 1, ended_at: null,
-        last_active: 1, is_active: false, message_count: 2, tool_call_count: 0, input_tokens: 1, output_tokens: 1, preview: "hi" },
-    ]);
+  it("loads messages from the row's owning profile when expanded", async () => {
+    await renderOwnedSession();
 
-    // expand → transcript read
     await act(async () => click(button("Delete session")!.closest("div.cursor-pointer")));
     await waitFor(() => apiMocks.getSessionMessages.mock.calls.length > 0);
-    expect(apiMocks.getSessionMessages).toHaveBeenCalledWith("sid-guanli", "guanli");
+    expect(apiMocks.getSessionMessages).toHaveBeenCalledWith(sessionId, owningProfile);
+  });
+
+  it("builds the export URL with the row's owning profile", async () => {
+    await renderOwnedSession();
 
     await act(async () => click(button("Export session")));
-    expect(apiMocks.exportSessionUrl).toHaveBeenCalledWith("sid-guanli", "guanli");
+    expect(apiMocks.exportSessionUrl).toHaveBeenCalledWith(sessionId, owningProfile);
+  });
+
+  it("renames the session through the row's owning profile", async () => {
+    await renderOwnedSession();
 
     await act(async () => click(button("Rename session")));
     const input = document.querySelector<HTMLInputElement>('input[placeholder="Session title"]');
@@ -141,7 +168,12 @@ describe("SessionsPage per-row profile routing (#99387)", () => {
       input.dispatchEvent(new Event("input", { bubbles: true }));
     });
     await act(async () => click(button("Save title")));
-    expect(apiMocks.renameSession).toHaveBeenCalledWith("sid-guanli", "Renamed", "guanli");
+    await waitFor(() => apiMocks.renameSession.mock.calls.length > 0);
+    expect(apiMocks.renameSession).toHaveBeenCalledWith(sessionId, "Renamed", owningProfile);
+  });
+
+  it("deletes the session through the row's owning profile", async () => {
+    await renderOwnedSession();
 
     await act(async () => click(button("Delete session")));
     await waitFor(() => Boolean(document.querySelector('[role="alertdialog"]')));
@@ -149,6 +181,7 @@ describe("SessionsPage per-row profile routing (#99387)", () => {
       (b) => b.textContent?.trim() === "Delete",
     );
     await act(async () => click(confirm ?? null));
-    expect(apiMocks.deleteSession).toHaveBeenCalledWith("sid-guanli", "guanli");
+    await waitFor(() => apiMocks.deleteSession.mock.calls.length > 0);
+    expect(apiMocks.deleteSession).toHaveBeenCalledWith(sessionId, owningProfile);
   });
 });
