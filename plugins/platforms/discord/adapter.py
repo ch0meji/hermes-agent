@@ -223,6 +223,8 @@ import sys
 from pathlib import Path as _Path
 sys.path.insert(0, str(_Path(__file__).resolve().parents[3]))
 
+_NASHICHAN_AVATAR_PATH = _Path(__file__).resolve().parent / "assets" / "nashichan-avatar.png"
+
 
 def _is_discord_transport_error(exc: BaseException) -> bool:
     """True for connection-shaped send failures (dead/dropping WS) that never reached Discord, so
@@ -1074,6 +1076,9 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         # off the connect path so a slow Bot API call (e.g. a set_my_commands stall for certain tokens)
         # cannot blow the gateway's connect timeout (#46298).
         self._post_connect_task: Optional[asyncio.Task] = None
+        # Discord avatars are account-level state, so apply the bundled Nashichan avatar once per
+        # adapter lifetime instead of on every reconnect (which would waste the profile mutation rate limit).
+        self._nashichan_avatar_attempted = False
         # WS liveness probe: REST 200 can't prove Gateway events still arrive, so sample WS
         # ready/open/ACK + heartbeat latency; consecutive failures -> retryable-fatal. 0 disables.
         self._liveness_interval_seconds = self._finite_positive_config_float(
@@ -2037,6 +2042,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         """Finish non-critical startup work after Discord is connected."""
         if not self._client:
             return
+        await self._apply_nashichan_avatar()
         try:
             sync_policy = self._get_discord_command_sync_policy()
             if sync_policy == "off":
@@ -2093,6 +2099,36 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             raise
         except Exception as e:  # pragma: no cover - defensive logging
             logger.warning("[%s] Slash command sync failed: %s", self.name, e, exc_info=True)
+
+    async def _apply_nashichan_avatar(self) -> None:
+        """Set the bot account avatar from the bundled Nashichan asset once per process.
+
+        Discord bot messages inherit the account avatar, so this keeps replies recognizable without
+        adding an image attachment to every message. Avatar setup is deliberately best-effort: a
+        missing asset or rejected profile mutation must not take the Discord gateway offline.
+        """
+        if self._nashichan_avatar_attempted:
+            return
+        self._nashichan_avatar_attempted = True
+        bot_user = getattr(self._client, "user", None) if self._client else None
+        edit = getattr(bot_user, "edit", None)
+        if not callable(edit):
+            logger.debug("[%s] Discord user avatar editing is unavailable", self.name)
+            return
+        try:
+            avatar = await asyncio.to_thread(_NASHICHAN_AVATAR_PATH.read_bytes)
+        except OSError as exc:
+            logger.warning(
+                "[%s] Could not read bundled Nashichan Discord avatar %s: %s",
+                self.name, _NASHICHAN_AVATAR_PATH, exc,
+            )
+            return
+        try:
+            await edit(avatar=avatar)
+        except Exception as exc:  # pragma: no cover - Discord API failure is environment-dependent
+            logger.warning("[%s] Could not apply Nashichan Discord avatar: %s", self.name, exc)
+            return
+        logger.info("[%s] Applied bundled Nashichan Discord avatar", self.name)
 
     def _missed_message_backfill_enabled(self) -> bool:
         """Whether to reconcile Discord messages missed while the gateway was down."""

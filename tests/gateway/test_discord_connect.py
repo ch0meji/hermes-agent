@@ -99,7 +99,7 @@ class FakeBot:
         self.intents = intents
         self.allowed_mentions = allowed_mentions
         self.application_id = 999
-        self.user = SimpleNamespace(id=999, name="Hermes")
+        self.user = SimpleNamespace(id=999, name="Hermes", edit=AsyncMock())
         self._events = {}
         self.tree = FakeTree()
         self.http = SimpleNamespace(
@@ -138,6 +138,20 @@ class SlowSyncBot(FakeBot):
     def __init__(self, *, intents, proxy=None):
         super().__init__(intents=intents, proxy=proxy)
         self.tree = SlowSyncTree()
+
+
+@pytest.mark.asyncio
+async def test_apply_nashichan_avatar_uses_bundled_png_once():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="test-token"))
+    edit = AsyncMock()
+    adapter._client = SimpleNamespace(user=SimpleNamespace(edit=edit))
+
+    await adapter._apply_nashichan_avatar()
+    await adapter._apply_nashichan_avatar()
+
+    edit.assert_awaited_once()
+    avatar = edit.await_args.kwargs["avatar"]
+    assert avatar.startswith(b"\x89PNG\r\n\x1a\n")
 
 
 @pytest.mark.asyncio
@@ -706,4 +720,3 @@ class TestPrivilegedIntentsRequiredFatal:
         assert "Message Content Intent" in (adapter.fatal_error_message or "")
         assert "discord.com/developers/applications" in (adapter.fatal_error_message or "")
         assert adapter._bot_task is None
-
