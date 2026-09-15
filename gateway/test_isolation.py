@@ -241,8 +241,11 @@ def process_ownership_matches(owner: ProcessOwnership) -> bool:
         # exists, so the captured ``pgid == pid`` remains an ownership proof.
         if owner.pgid != owner.pid or owner.pgid <= 1 or owner.pgid == os.getpgrp():
             return False
+        killpg = getattr(os, "killpg", None)
+        if killpg is None:
+            return False
         try:
-            os.killpg(owner.pgid, 0)
+            killpg(owner.pgid, 0)
         except OSError:
             return False
         return True
@@ -256,8 +259,11 @@ def terminate_owned_process_group(
     """Signal only the captured child process group; never use name-based killing."""
     if not process_ownership_matches(owner):
         return False
+    killpg = getattr(os, "killpg", None)
+    if killpg is None:
+        return False
     try:
-        os.killpg(owner.pgid, sig)
+        killpg(owner.pgid, sig)
     except ProcessLookupError:
         return False
     except PermissionError as exc:
@@ -278,7 +284,8 @@ def cleanup_owned_process_group(owner: ProcessOwnership, *, grace_seconds: float
         return False
     # The runner is already in its bounded cleanup path. Escalate only against
     # the same verified group; never fall back to a process-name search.
-    terminate_owned_process_group(owner, sig=signal.SIGKILL)
+    kill_signal = getattr(signal, "SIGKILL", signal.SIGTERM)
+    terminate_owned_process_group(owner, sig=kill_signal)
     return True
 
 
