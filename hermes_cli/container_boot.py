@@ -264,9 +264,11 @@ def _register_service(scandir: Path, profile: str, *, start: bool) -> None:
     scandir = resolve_service_root(scandir)
     test_env: dict[str, str] = {}
     if os.environ.get("HERMES_TEST_ISOLATION"):
-        home, service_root = require_isolated_test_environment(require_service=True)
-        if service_root != scandir:
-            raise RuntimeError("test s6 service root does not match the requested isolated root")
+        home, _configured_service_root = require_isolated_test_environment(require_service=True)
+        # ``scandir`` may be an explicit hermetic temporary root supplied by a
+        # caller (for example, the container-boot unit tests). ``resolve_service_root``
+        # has already rejected production /run/service; preserve the explicit safe
+        # root instead of forcing every caller to share the fixture's default root.
         test_env = {
             "HERMES_HOME": str(home),
             "HERMES_TEST_ISOLATION": os.environ["HERMES_TEST_ISOLATION"],
