@@ -55,6 +55,16 @@ from concurrent.futures import ThreadPoolExecutor, Future
 from pathlib import Path
 from typing import Dict, List, Tuple
 
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
+from gateway.test_isolation import (
+    GatewayIsolationError,
+    ProcessOwnership,
+    capture_process_ownership,
+    cleanup_owned_process_group,
+)
 
 # Default test discovery roots.
 _DEFAULT_ROOTS = ["tests"]
@@ -245,32 +255,17 @@ def _discover_files(roots: List[Path]) -> List[Path]:
     return sorted(out)
 
 
-def _kill_tree(proc: "subprocess.Popen", pgid: int | None = None) -> None:
-    """Kill the pytest subprocess and every descendant it spawned.
+def _kill_tree(
+    proc: "subprocess.Popen",
+    pgid: int | None = None,
+    *,
+    owner: ProcessOwnership | None = None,
+) -> None:
+    """Terminate only the captured test child process group.
 
-    A test run can spin up uvicorn servers, async runtimes, or other
-    long-running grandchildren that survive the pytest subprocess exit
-    if we don't kill the whole tree. ``subprocess.Popen.kill()`` only
-    targets the immediate child; grandchildren reparent to PID 1
-    (Linux) / get adopted by services.exe (Windows) and leak.
-
-    POSIX: the caller must pass ``pgid`` — the process group id captured
-    immediately after Popen (via ``os.getpgid(proc.pid)``). We can't
-    look it up here in the happy path because by the time we get
-    called the leader process has already been reaped and its pid is
-    gone from the kernel's process table, even though descendants in
-    the group are still alive. SIGKILL'ing the captured pgid takes out
-    everything in that group atomically.
-
-    Windows: ``taskkill /F /T /PID`` walks the recorded ppid chain and
-    terminates the whole tree, even when the root has already exited.
-
-    Why not psutil: psutil walks the parent-child tree, but in the
-    happy path the root has already been reaped so ``psutil.Process(pid)``
-    can't find it; grandchildren reparented to PID 1 are also
-    unreachable by tree walk at that point. The platform-native
-    primitives (process groups / taskkill) handle both cases correctly
-    without an extra abstraction layer.
+    ``pgid`` remains accepted for callers compiled against the old helper, but
+    it is deliberately ignored unless an ownership record was captured. A raw
+    group ID is not sufficient protection against PID/process-group reuse.
     """
     if proc.pid is None:
         return
@@ -287,13 +282,13 @@ def _kill_tree(proc: "subprocess.Popen", pgid: int | None = None) -> None:
         except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
             pass
     else:
-        # POSIX: kill the captured pgid. Local-import signal so the
-        # SIGKILL attribute is never referenced on Windows.
-        if pgid is not None:
+        # POSIX: only a verified PID/process-group/start-time ownership record
+        # may reach killpg. The legacy raw pgid argument is intentionally not
+        # trusted.
+        if owner is not None:
             try:
-                import signal as _signal
-                os.killpg(pgid, _signal.SIGKILL)  # windows-footgun: ok
-            except (ProcessLookupError, PermissionError, OSError):
+                cleanup_owned_process_group(owner)
+            except (GatewayIsolationError, ProcessLookupError, PermissionError, OSError):
                 pass
 
     # Belt-and-suspenders: ensure subprocess.communicate() sees the exit.
@@ -418,22 +413,23 @@ def _run_one_file_once(
         start_new_session=True,
     )
 
-    # Capture the pgid NOW, before the leader can exit and be reaped. Once
-    # the leader is reaped, os.getpgid(proc.pid) raises ProcessLookupError
-    # even though grandchildren in that group are still alive — defeating
-    # the whole cleanup. None on Windows where the pgid concept doesn't apply.
+    # Capture an explicit ownership record immediately after Popen. A raw
+    # pgid is retained only for compatibility with the helper signature.
     pgid: int | None = None
+    owner: ProcessOwnership | None = None
     if sys.platform != "win32":
         try:
-            pgid = os.getpgid(proc.pid)
-        except (ProcessLookupError, PermissionError):
+            owner = capture_process_ownership(proc.pid)
+            pgid = owner.pgid
+        except (GatewayIsolationError, ProcessLookupError, PermissionError, OSError):
+            owner = None
             pgid = None
 
     try:
         output, _ = proc.communicate(timeout=file_timeout)
         rc = proc.returncode
     except subprocess.TimeoutExpired:
-        _kill_tree(proc, pgid=pgid)
+        _kill_tree(proc, pgid=pgid, owner=owner)
         try:
             output, _ = proc.communicate(timeout=10)
         except subprocess.TimeoutExpired:
@@ -446,12 +442,12 @@ def _run_one_file_once(
     except BaseException:
         # KeyboardInterrupt / runner crash — make sure no zombie
         # grandchildren outlive us.
-        _kill_tree(proc, pgid=pgid)
+        _kill_tree(proc, pgid=pgid, owner=owner)
         raise
     else:
         # Happy path: pytest exited on its own. Kill the group anyway in
         # case it left grandchildren behind; already-dead is a no-op.
-        _kill_tree(proc, pgid=pgid)
+        _kill_tree(proc, pgid=pgid, owner=owner)
 
         output +=  "\n"
     finally:

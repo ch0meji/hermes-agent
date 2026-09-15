@@ -11,6 +11,12 @@ import time
 from pathlib import Path
 from typing import Literal, Protocol, runtime_checkable
 
+from gateway.test_isolation import (
+    assert_runtime_path_safe,
+    assert_service_operation,
+    resolve_service_root,
+)
+
 ServiceManagerKind = Literal["systemd", "launchd", "windows", "s6", "none"]
 
 # Profile names become s6 service directory names (``<scandir>/gateway-<profile>/``), so they
@@ -241,6 +247,7 @@ def _profile_dir_for_gateway_service(name: str) -> Path:
     profile = _profile_from_service(name)
     validate_profile_name(profile)
     hermes_home = Path(os.environ.get("HERMES_HOME", "/opt/data"))
+    hermes_home = assert_runtime_path_safe(hermes_home, label="Hermes home")
     root = hermes_home.parent.parent if hermes_home.parent.name == "profiles" else hermes_home
     return root if profile == "default" else root / "profiles" / profile
 
@@ -252,6 +259,7 @@ def _write_gateway_desired_state(name: str, desired_state: str) -> None:
     """
     profile_dir = _profile_dir_for_gateway_service(name)
     state_file = profile_dir / "gateway_state.json"
+    assert_runtime_path_safe(state_file, label="gateway state")
     try:
         if not profile_dir.exists():
             return
@@ -391,8 +399,10 @@ class S6ServiceManager:
 
     kind: ServiceManagerKind = "s6"
 
-    def __init__(self, scandir: Path = S6_DYNAMIC_SCANDIR) -> None:
-        self.scandir = scandir
+    def __init__(self, scandir: Path | None = None) -> None:
+        # In pytest, None is intentionally an error rather than an alias for
+        # /run/service. Production keeps the historical default.
+        self.scandir = resolve_service_root(scandir)
 
     def _service_dir(self, profile: str) -> Path:
         validate_profile_name(profile)
@@ -420,16 +430,40 @@ class S6ServiceManager:
         item I5 retired both the allocator and the parameter because they were dead code through the entire
         stack.
         """
-        lines = [
-            "#!/command/with-contenv sh",
-            "# shellcheck shell=sh",
-            "set -e",
-            "export HOME=/opt/data",
-            "cd /opt/data",
-            ". /opt/hermes/.venv/bin/activate",
-        ]
+        test_script = bool(extra_env.get("HERMES_TEST_ISOLATION"))
+        if test_script:
+            # Do not bake the production working directory into a test service.
+            home = extra_env.get("HERMES_HOME", "")
+            service_root = extra_env.get("HERMES_TEST_SERVICE_ROOT", "")
+            if not home or not service_root:
+                raise RuntimeError(
+                    "isolated test s6 script requires HERMES_HOME and "
+                    "HERMES_TEST_SERVICE_ROOT"
+                )
+            home_path = assert_runtime_path_safe(home, label="test Hermes home")
+            resolve_service_root(service_root)
+            lines = [
+                "#!/command/with-contenv sh",
+                "# shellcheck shell=sh",
+                "set -e",
+            ]
+        else:
+            home_path = None
+            lines = [
+                "#!/command/with-contenv sh",
+                "# shellcheck shell=sh",
+                "set -e",
+                "export HOME=/opt/data",
+                "cd /opt/data",
+            ]
         for k, v in sorted(extra_env.items()):
             lines.append(f"export {k}={shlex.quote(v)}")
+        if test_script:
+            lines.extend([
+                f"export HOME={shlex.quote(str(home_path))}",
+                f"cd {shlex.quote(str(home_path))}",
+            ])
+        lines.append(". /opt/hermes/.venv/bin/activate")
         # Supervised-child sentinel: without it the supervised gateway re-entering
         # `_gateway_command_inner` with subcmd == "run" would dispatch `gateway start` → re-exec
         # `gateway run --replace` → `gateway start` … (see the matching guard there).
@@ -484,16 +518,32 @@ class S6ServiceManager:
         )
 
     @staticmethod
-    def _render_log_run(profile: str) -> str:
+    def _render_log_run(profile: str, extra_env: dict[str, str] | None = None) -> str:
         """log/run script. s6-log directives apply per line in order; ``T`` (timestamp) is
         non-sticky and only prefixes lines for the next action directive, so it sits between
         ``1`` and the log dir rather than before ``1``."""
         prof = shlex.quote(profile)
+        extra_env = extra_env or {}
+        test_script = bool(extra_env.get("HERMES_TEST_ISOLATION"))
+        if test_script:
+            home = extra_env.get("HERMES_HOME", "")
+            if not home:
+                raise RuntimeError("isolated test s6 log script requires HERMES_HOME")
+            home_path = assert_runtime_path_safe(home, label="test Hermes log home")
+            home_line = f': "${{HERMES_HOME:?test service requires HERMES_HOME}}"\n'
+        else:
+            home_path = None
+            home_line = ': "${HERMES_HOME:=/opt/data}"\n'
+        log_dir_line = (
+            f'log_dir="{home_path}/logs/gateways/{prof}"\n'
+            if test_script
+            else f'log_dir="$HERMES_HOME/logs/gateways/{prof}"\n'
+        )
         return (
             f"#!/command/with-contenv sh\n"
             f"# shellcheck shell=sh\n"
-            f': "${{HERMES_HOME:=/opt/data}}"\n'
-            f'log_dir="$HERMES_HOME/logs/gateways/{prof}"\n'
+            f"{home_line}"
+            f"{log_dir_line}"
             # Create the leaf and clear a stale s6-log lock AS HERMES when starting as root. Never
             # chown/unlink hermes-writable volume paths from this restartable root-context script:
             # an unprivileged user can race a pathname op through a symlink swap (CWE-59/CWE-367).
@@ -516,6 +566,7 @@ class S6ServiceManager:
     def _run_svc(self, action_flag: str, action_label: str, name: str) -> None:
         """``s6-svc <action_flag>``; a missing service dir raises ``GatewayNotRegisteredError``
         (instead of s6-svc's opaque failure) and any other failure ``S6CommandError``."""
+        assert_service_operation(self.scandir, name, action_label)
         service_dir = self.scandir / name
         if not service_dir.is_dir():
             raise GatewayNotRegisteredError(_profile_from_service(name))
@@ -561,6 +612,7 @@ class S6ServiceManager:
         _write_gateway_desired_state(name, "running")
 
     def is_running(self, name: str) -> bool:
+        assert_service_operation(self.scandir, name, "status")
         result = _s6_run("s6-svstat", str(self.scandir / name))
         return result.returncode == 0 and "up " in result.stdout
 
@@ -578,6 +630,7 @@ class S6ServiceManager:
         ``gateway start``. Raises ValueError on an invalid name or existing directory, RuntimeError
         if ``s6-svscanctl`` fails.
         """
+        assert_service_operation(self.scandir, f"{S6_SERVICE_PREFIX}{profile}", "register")
         svc_dir = self._service_dir(profile)
         if svc_dir.exists():
             raise ValueError(f"profile gateway {profile!r} already registered at {svc_dir}")
@@ -627,6 +680,7 @@ class S6ServiceManager:
         root-owned but the parent ``supervise/`` is hermes-owned (see ``_seed_supervise_skeleton``)
         and POSIX only needs write+execute on the parent to remove them.
         """
+        assert_service_operation(self.scandir, f"{S6_SERVICE_PREFIX}{profile}", "unregister")
         svc_dir = self._service_dir(profile)
         if not svc_dir.exists():
             return
@@ -640,6 +694,7 @@ class S6ServiceManager:
 
     def list_profile_gateways(self) -> list[str]:
         """Profile names of all currently-registered gateway services."""
+        assert_service_operation(self.scandir, "gateway-*", "list")
         if not self.scandir.exists():
             return []
         return [
