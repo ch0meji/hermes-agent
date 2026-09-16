@@ -631,6 +631,7 @@ class S6ServiceManager:
         if ``s6-svscanctl`` fails.
         """
         assert_service_operation(self.scandir, f"{S6_SERVICE_PREFIX}{profile}", "register")
+        extra_env = extra_env or {}
         svc_dir = self._service_dir(profile)
         if svc_dir.exists():
             raise ValueError(f"profile gateway {profile!r} already registered at {svc_dir}")
@@ -651,10 +652,10 @@ class S6ServiceManager:
 
         try:
             (tmp_dir / "type").write_text("longrun\n", encoding="utf-8")
-            _write_script(tmp_dir / "run", self._render_run_script(profile, extra_env or {}))
+            _write_script(tmp_dir / "run", self._render_run_script(profile, extra_env))
             _write_script(tmp_dir / "finish", self._render_finish_script())
             (tmp_dir / "log").mkdir()
-            _write_script(tmp_dir / "log" / "run", self._render_log_run(profile))
+            _write_script(tmp_dir / "log" / "run", self._render_log_run(profile, extra_env))
             # Seed hermes-owned supervise/ BEFORE publishing so the hermes-user s6-svc/s6-svstat/
             # s6-svwait calls never hit root-owned 0700 dirs (see _seed_supervise_skeleton).
             _seed_supervise_skeleton(tmp_dir)
