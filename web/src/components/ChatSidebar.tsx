@@ -15,11 +15,12 @@
  *   2. **Event subscriber** (/api/events?channel=…) — passive, receives
  *      every dispatcher emit from the PTY-side `tui_gateway.entry` that
  *      the dashboard fanned out.  The sidebar uses it for `session.info`
- *      (live chat title) and `dashboard.new_session_requested`.  The
- *      `channel` id ties this listener to the same chat tab's PTY child —
- *      see `ChatPage.tsx` for where the id is generated.  Transient drops
- *      (gateway restart, network blip) auto-reconnect with exponential
- *      backoff; auth rejections are terminal.  See `lib/events-reconnect`.
+ *      (live chat title), `dashboard.new_session_requested`, and the
+ *      presentation-only Nashichan dashboard mascot. The `channel` id ties
+ *      this listener to the same chat tab's PTY child — see `ChatPage.tsx`
+ *      for where the id is generated. Transient drops (gateway restart,
+ *      network blip) auto-reconnect with exponential backoff; auth
+ *      rejections are terminal. See `lib/events-reconnect`.
  *
  * Best-effort throughout: WS failures show in the badge / banner, the
  * terminal pane keeps working unimpaired.
@@ -31,6 +32,7 @@ import { Card } from "@nous-research/ui/ui/components/card";
 
 import { ModelPickerDialog } from "@/components/ModelPickerDialog";
 import { ModelReloadConfirm } from "@/components/ModelReloadConfirm";
+import { NashichanPanel } from "@/components/nashichan/NashichanPanel";
 import { ReasoningPicker } from "@/components/ReasoningPicker";
 import { GatewayClient, type ConnectionState } from "@/lib/gatewayClient";
 import { api, buildWsUrl } from "@/lib/api";
@@ -49,6 +51,7 @@ import {
 } from "@/lib/events-reconnect";
 import { titleFromSessionInfoPayload } from "@/lib/chat-title";
 
+import { useNashichanState } from "@/hooks/useNashichanState";
 import { cn } from "@/lib/utils";
 import { AlertCircle, ChevronDown, RefreshCw } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -128,6 +131,13 @@ export function ChatSidebar({
   const [info, setInfo] = useState<SessionInfo>({});
   const [modelOpen, setModelOpen] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const {
+    state: nashichanState,
+    handleHermesEvent: handleNashichanEvent,
+  } = useNashichanState({
+    connectionState: state,
+    hasConnectionError: Boolean(error),
+  });
   // The badge shows config.yaml's main model (`model.default`) via
   // `/api/model/info` — the same value the Models page writes and a new chat
   // session boots from. We deliberately don't use the sidecar's `session.info`
@@ -405,6 +415,7 @@ export function ChatSidebar({
         }
 
         const { type, payload } = frame.params;
+        handleNashichanEvent(type, payload);
 
         if (type === "session.info") {
           const title = titleFromSessionInfoPayload(payload);
@@ -429,7 +440,13 @@ export function ChatSidebar({
       }
       ws?.close();
     };
-  }, [channel, onDashboardNewSessionRequest, onSessionTitleChange, version]);
+  }, [
+    channel,
+    handleNashichanEvent,
+    onDashboardNewSessionRequest,
+    onSessionTitleChange,
+    version,
+  ]);
 
   // Seed the badge on mount and re-read it whenever the sockets are rebuilt
   // (a profile/channel switch bumps `version`).
@@ -457,6 +474,8 @@ export function ChatSidebar({
         className,
       )}
     >
+      <NashichanPanel state={nashichanState} />
+
       <Card className="flex items-center justify-between gap-2 px-3 py-2">
         <div className="min-w-0 flex-1">
           <div className="text-display text-xs tracking-wider text-text-tertiary">
