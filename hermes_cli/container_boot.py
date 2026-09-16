@@ -256,10 +256,24 @@ def _register_service(scandir: Path, profile: str, *, start: bool) -> None:
     """
     import shutil
 
+    from gateway.test_isolation import require_isolated_test_environment, resolve_service_root
     from hermes_cli.service_manager import (
         S6ServiceManager, _seed_supervise_skeleton, validate_profile_name)
 
     validate_profile_name(profile)
+    scandir = resolve_service_root(scandir)
+    test_env: dict[str, str] = {}
+    if os.environ.get("HERMES_TEST_ISOLATION"):
+        home, _configured_service_root = require_isolated_test_environment(require_service=True)
+        # ``scandir`` may be an explicit hermetic temporary root supplied by a
+        # caller (for example, the container-boot unit tests). ``resolve_service_root``
+        # has already rejected production /run/service; preserve the explicit safe
+        # root instead of forcing every caller to share the fixture's default root.
+        test_env = {
+            "HERMES_HOME": str(home),
+            "HERMES_TEST_ISOLATION": os.environ["HERMES_TEST_ISOLATION"],
+            "HERMES_TEST_SERVICE_ROOT": str(scandir),
+        }
     service_dir = scandir / f"gateway-{profile}"
     # Dot-prefixed so s6-svscan skips the staging dir: a non-dotted name gets supervised AS ROOT
     # by a concurrent rescan, creating a root-owned ``supervise/`` → EACCES in the seed below.
@@ -271,10 +285,10 @@ def _register_service(scandir: Path, profile: str, *, start: bool) -> None:
         (tmp_dir / "type").write_text("longrun\n", encoding="utf-8")
         # Manager's own rendering keeps both registration paths consistent; per-profile env
         # comes from the profile's config.yaml, so extra_env is empty.
-        _write_exec(tmp_dir / "run", S6ServiceManager._render_run_script(profile, extra_env={}))
+        _write_exec(tmp_dir / "run", S6ServiceManager._render_run_script(profile, extra_env=test_env))
         _write_exec(tmp_dir / "finish", S6ServiceManager._render_finish_script())
         (tmp_dir / "log").mkdir()
-        _write_exec(tmp_dir / "log" / "run", S6ServiceManager._render_log_run(profile))
+        _write_exec(tmp_dir / "log" / "run", S6ServiceManager._render_log_run(profile, extra_env=test_env))
         if not start:  # `hermes -p <profile> gateway start` brings it up later (s6-svc -u)
             (tmp_dir / "down").touch()
         # Pre-create supervise/ with hermes ownership BEFORE publishing so s6-supervise inherits

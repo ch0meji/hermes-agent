@@ -20,6 +20,7 @@ POSIX-only: Windows has its own grandchild lifecycle (no shared session,
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import subprocess
@@ -29,6 +30,92 @@ import time
 from pathlib import Path
 
 import pytest
+
+
+@pytest.fixture(scope="module")
+def parallel_runner():
+    """Load the runner module without spawning a process."""
+    repo_root = Path(__file__).resolve().parent.parent
+    script = repo_root / "scripts" / "run_tests_parallel.py"
+    spec = importlib.util.spec_from_file_location("run_tests_parallel_for_test", script)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+class _FakeWindowsPopen:
+    pid = 4321
+    _handle = object()
+
+    def __init__(self) -> None:
+        self.kill_calls = 0
+
+    def kill(self) -> None:
+        self.kill_calls += 1
+
+
+def test_windows_cleanup_refuses_pid_reuse(parallel_runner, monkeypatch) -> None:
+    """A creation-time mismatch must not send taskkill to a reused PID."""
+    proc = _FakeWindowsPopen()
+    taskkill_calls: list[list[str]] = []
+
+    monkeypatch.setattr(parallel_runner.sys, "platform", "win32")
+    monkeypatch.setattr(parallel_runner, "_windows_pid_creation_time", lambda _pid: 200)
+    monkeypatch.setattr(
+        parallel_runner.subprocess,
+        "run",
+        lambda cmd, **_kwargs: taskkill_calls.append(cmd),
+    )
+
+    parallel_runner._kill_tree(
+        proc,
+        owner=parallel_runner._WindowsProcessOwnership(proc.pid, 100),
+    )
+
+    assert taskkill_calls == []
+    assert proc.kill_calls == 0
+
+
+def test_windows_cleanup_refuses_unavailable_ownership(parallel_runner, monkeypatch) -> None:
+    """Unavailable ownership must not kill an unrelated Windows PID."""
+    proc = _FakeWindowsPopen()
+    taskkill_calls: list[list[str]] = []
+
+    monkeypatch.setattr(parallel_runner.sys, "platform", "win32")
+    monkeypatch.setattr(
+        parallel_runner.subprocess,
+        "run",
+        lambda cmd, **_kwargs: taskkill_calls.append(cmd),
+    )
+
+    parallel_runner._kill_tree(proc, owner=None)
+
+    assert taskkill_calls == []
+    assert proc.kill_calls == 0
+
+
+def test_windows_cleanup_allows_confirmed_child(parallel_runner, monkeypatch) -> None:
+    """A creation-time match permits tree cleanup for the spawned child."""
+    proc = _FakeWindowsPopen()
+    taskkill_calls: list[list[str]] = []
+
+    monkeypatch.setattr(parallel_runner.sys, "platform", "win32")
+    monkeypatch.setattr(parallel_runner, "_windows_pid_creation_time", lambda _pid: 100)
+    monkeypatch.setattr(
+        parallel_runner.subprocess,
+        "run",
+        lambda cmd, **_kwargs: taskkill_calls.append(cmd),
+    )
+
+    parallel_runner._kill_tree(
+        proc,
+        owner=parallel_runner._WindowsProcessOwnership(proc.pid, 100),
+    )
+
+    assert taskkill_calls == [["taskkill", "/F", "/T", "/PID", str(proc.pid)]]
+    assert proc.kill_calls == 1
 
 
 # Both tests share the same handoff file: the leaker writes here, the
