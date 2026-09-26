@@ -405,6 +405,41 @@ def test_s6_log_run_creates_leaf_as_hermes_without_chown(
     assert '/opt/data/logs/gateways"' not in log_text
 
 
+def test_test_registration_writes_isolated_run_and_log_run(
+    s6_scandir, fake_subprocess_run, tmp_path
+) -> None:
+    """A test registration must not render either script with production log paths."""
+    home = tmp_path / "hermes-home"
+    state = home / "gateway-runtime"
+    services = home / "s6-service"
+    for path in (home, state, services):
+        path.mkdir(parents=True, exist_ok=True)
+
+    extra_env = {
+        "HERMES_HOME": str(home),
+        "HERMES_TEST_ISOLATION": str(home),
+        "HERMES_TEST_STATE_ROOT": str(state),
+        "HERMES_TEST_SERVICE_ROOT": str(services),
+    }
+    S6ServiceManager(scandir=s6_scandir).register_profile_gateway(
+        "coder", extra_env=extra_env
+    )
+
+    service_dir = s6_scandir / "gateway-coder"
+    run_text = (service_dir / "run").read_text(encoding="utf-8")
+    log_text = (service_dir / "log" / "run").read_text(encoding="utf-8")
+    expected_log_dir = f'{home}/logs/gateways/coder'
+
+    assert (service_dir / "run").is_file()
+    assert (service_dir / "log" / "run").is_file()
+    assert f"export HERMES_HOME={home}" in run_text
+    assert f"cd {home}" in run_text
+    assert "/opt/data" not in log_text
+    assert [
+        line for line in log_text.splitlines() if line.startswith("log_dir=")
+    ] == [f'log_dir="{expected_log_dir}"']
+
+
 def test_s6_log_run_never_invokes_chown_with_symlinked_log_dir(tmp_path) -> None:
     """Symlinked ``$log_dir`` must not redirect root chown/rm to the referent."""
     import os

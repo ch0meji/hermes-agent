@@ -493,6 +493,16 @@ def _hermetic_environment(tmp_path, monkeypatch):
     (fake_hermes_home / "memories").mkdir()
     (fake_hermes_home / "skills").mkdir()
     monkeypatch.setenv("HERMES_HOME", str(fake_hermes_home))
+    monkeypatch.setenv("HERMES_TEST_ISOLATION", str(fake_hermes_home))
+    # Every test gets explicit, distinct state and s6 service roots. Runtime
+    # code must never infer /run/service or the production data root.
+    test_state_root = fake_hermes_home / "gateway-runtime"
+    test_service_root = fake_hermes_home / "s6-service"
+    test_state_root.mkdir()
+    test_service_root.mkdir()
+    monkeypatch.setenv("HERMES_TEST_PROFILE", "pytest")
+    monkeypatch.setenv("HERMES_TEST_STATE_ROOT", str(test_state_root))
+    monkeypatch.setenv("HERMES_TEST_SERVICE_ROOT", str(test_service_root))
     # Keep the subprocess-surviving isolation marker pointed at THIS test's
     # home (#82770): children spawned by the test inherit it by default, so
     # hermes_state's live-DB guard stays armed in them even when the test
@@ -1399,7 +1409,7 @@ def _live_system_guard(request, monkeypatch):
                 return real_killpg(pgid, sig, *args, **kwargs)
             raise RuntimeError(
                 f"tests/conftest.py live-system guard: blocked "
-                f"os.killpg({pgid}, {sig}) — PGID is outside the test "
+                f"os.killpg({pgid}, {sig}) — PGID is outside the test "  # windows-footgun: ok — POSIX-only guarded test hook
                 "process group. See _live_system_guard for the why."
             )
 
