@@ -1,5 +1,6 @@
 """Discord bus contract tests for the Codex ↔ Hermes Ops handoff."""
 
+import asyncio
 import os
 import sys
 from datetime import datetime, timezone
@@ -9,8 +10,10 @@ from unittest.mock import AsyncMock
 import pytest
 
 from gateway.config import Platform, PlatformConfig
+from gateway.platforms.event import MessageType
 from gateway.run_inbound import GatewayInboundMixin
-from gateway.session import SessionSource
+from gateway.run_busy import GatewayBusySessionMixin
+from gateway.session import SessionSource, build_session_key
 from plugins.platforms.discord.handoff import (
     MAX_HANDOFF_MESSAGE_CHARS,
     HandoffDedupe,
@@ -156,12 +159,15 @@ def discord_adapter(monkeypatch):
     return adapter
 
 
-def _message(adapter, *, author_id, bot, channel_id=18765, content=None, message_id=1, thread=False):
+def _message(
+    adapter, *, author_id, bot, channel_id=18765, content=None, message_id=1,
+    thread=False, thread_id=None, handoff_id="H-20260909-001",
+):
     parent = adapter._test_channel_factory(channel_id)
-    channel = adapter._test_thread_factory(channel_id + 1, parent) if thread else parent
+    channel = adapter._test_thread_factory(thread_id or channel_id + 1, parent) if thread else parent
     return SimpleNamespace(
         id=message_id,
-        content=content if content is not None else _valid_content(),
+        content=content if content is not None else _valid_content(handoff_id),
         mentions=[],
         attachments=[],
         reference=None,
@@ -209,6 +215,41 @@ def test_admission_is_channel_sender_and_protocol_specific(discord_adapter, monk
         message_id=8,
     )
     assert discord_adapter._discord_message_admission(normal_with_global_bot_opt_in, claim=True) == (False, False)
+
+
+@pytest.mark.parametrize("thread", [False, True])
+@pytest.mark.asyncio
+async def test_human_handoff_channel_and_thread_posts_are_never_dispatched(discord_adapter, thread):
+    import plugins.platforms.discord.adapter as discord_platform
+
+    discord_adapter._test_message_type = discord_platform.discord.MessageType.default
+    discord_adapter._ready_event.set()
+    message = _message(
+        discord_adapter, author_id=42, bot=False, thread=thread,
+        thread_id=32001 if thread else None, message_id=320 if thread else 319,
+    )
+
+    assert await discord_adapter._dispatch_discord_message(message) is False
+    discord_adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("author_id", "content"),
+    [
+        (1545113469244674209, _valid_content("H-20261003-101")),
+        (1545456768430121022, _valid_content("H-20261003-102").replace("type: ops_handoff", "type: invalid")),
+    ],
+)
+def test_thread_rejects_other_bots_and_malformed_handoffs(discord_adapter, author_id, content):
+    import plugins.platforms.discord.adapter as discord_platform
+
+    discord_adapter._test_message_type = discord_platform.discord.MessageType.default
+    message = _message(
+        discord_adapter, author_id=author_id, bot=True, thread=True,
+        thread_id=32002 + author_id % 10, content=content, message_id=321 + author_id % 10,
+    )
+
+    assert discord_adapter._discord_message_admission(message, claim=True) == (False, False)
 
 
 @pytest.mark.parametrize("author_id", [1545456768430121022, 1545113469244674209, 123456])
@@ -343,15 +384,143 @@ async def test_dispatch_dedupes_discord_message_and_handoff_id(discord_adapter):
     discord_adapter._ready_event.set()
     first = _message(
         discord_adapter, author_id=1545456768430121022, bot=True, message_id=21,
+        thread=True, thread_id=31001,
     )
     assert await discord_adapter._dispatch_discord_message(first) is True
     assert await discord_adapter._dispatch_discord_message(first) is False
 
     same_handoff_new_message = _message(
         discord_adapter, author_id=1545456768430121022, bot=True, message_id=22,
+        thread=True, thread_id=31002,
     )
     assert await discord_adapter._dispatch_discord_message(same_handoff_new_message) is False
     discord_adapter.handle_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_handoff_dispatch_bypasses_text_batch_and_runs_one_two_or_five_threads(discord_adapter):
+    """Complete handoffs enter their own thread session immediately, even inside the text window."""
+    import plugins.platforms.discord.adapter as discord_platform
+
+    discord_adapter._test_message_type = discord_platform.discord.MessageType.default
+    discord_adapter._ready_event.set()
+    discord_adapter._text_batch_delay_seconds = 0.1
+    del discord_adapter.handle_message  # exercise BasePlatformAdapter's real session guard
+    discord_adapter.config.typing_indicator = False
+
+    for count in (1, 2, 5):
+        started = []
+        finished = []
+        active_keys = set()
+        max_active = 0
+        all_started = asyncio.Event()
+        all_finished = asyncio.Event()
+        release = asyncio.Event()
+
+        async def hold_session(event):
+            nonlocal max_active
+            key = discord_adapter._event_session_key(event)
+            started.append((event, key))
+            active_keys.add(key)
+            max_active = max(max_active, len(active_keys))
+            if len(started) == count:
+                all_started.set()
+            await release.wait()
+            active_keys.remove(key)
+            finished.append(key)
+            if len(finished) == count:
+                all_finished.set()
+
+        discord_adapter._message_handler = hold_session
+        messages = [
+            _message(
+                discord_adapter,
+                author_id=1545456768430121022,
+                bot=True,
+                message_id=1000 + count * 10 + index,
+                thread=True,
+                thread_id=30000 + count * 10 + index,
+                handoff_id=f"H-20261003-{count * 10 + index:03d}",
+            )
+            for index in range(count)
+        ]
+        tasks = [asyncio.create_task(discord_adapter._dispatch_discord_message(message)) for message in messages]
+        try:
+            await asyncio.wait_for(all_started.wait(), timeout=2)
+            assert len(started) == count
+            assert len({key for _, key in started}) == count
+            assert {event.source.chat_id for event, _ in started} == {
+                str(message.channel.id) for message in messages
+            }
+            assert set(discord_adapter._active_sessions) == {key for _, key in started}
+            assert max_active == count
+            assert not discord_adapter._pending_text_batches
+        finally:
+            release.set()
+        assert await asyncio.gather(*tasks) == [True] * count
+        await asyncio.wait_for(all_finished.wait(), timeout=2)
+        await asyncio.gather(*tuple(discord_adapter._background_tasks), return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_distinct_busy_handoff_ids_stay_separate_fifo_events():
+    """Even a reused thread cannot collapse two Ops IDs into a pending text event."""
+    class FakeRunner(GatewayBusySessionMixin):
+        _BUSY_QUEUE_MAX_PENDING = 8
+
+        def __init__(self):
+            self.adapter = SimpleNamespace(_pending_messages={})
+            self._state = SimpleNamespace(conversation=SimpleNamespace(queued_events=[]))
+            self._draining = False
+
+        def _is_user_authorized(self, _source):
+            return True
+
+        def _effective_busy_input_mode(self, _source):
+            return "queue"
+
+        async def _route_plaintext_approval_while_busy(self, _event, _key):
+            return False
+
+        def _adapter_for_source(self, _source):
+            return self.adapter
+
+        def _queue_depth(self, key, *, adapter=None):
+            del key
+            return len(adapter._pending_messages) + len(self._state.conversation.queued_events)
+
+        def _session_state(self, _key):
+            return self._state
+
+    runner = FakeRunner()
+
+    def handoff_event(handoff_id):
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="thread-1",
+            chat_type="thread",
+            user_id="1545456768430121022",
+            is_bot=True,
+            thread_id="thread-1",
+            parent_chat_id="18765",
+            trusted_discord_handoff=True,
+        )
+        return SimpleNamespace(
+            source=source,
+            metadata={"discord_handoff": {"handoff_id": handoff_id}},
+            internal=False,
+            message_type=MessageType.TEXT,
+            text=f"payload for {handoff_id}",
+        )
+
+    first = handoff_event("H-20261003-001")
+    second = handoff_event("H-20261003-002")
+    assert await runner._handle_active_session_busy_message(first, "thread-session") is True
+    assert await runner._handle_active_session_busy_message(second, "thread-session") is True
+
+    assert runner.adapter._pending_messages["thread-session"] is first
+    assert runner._state.conversation.queued_events == [second]
+    assert [first.text, second.text] == ["payload for H-20261003-001", "payload for H-20261003-002"]
 
 
 @pytest.mark.asyncio
@@ -376,6 +545,9 @@ async def test_valid_handoff_reaches_existing_event_path_and_keeps_thread(discor
     assert event.source.chat_type == "thread"
     assert event.source.thread_id == str(message.channel.id)
     assert event.source.parent_chat_id == "18765"
+    assert build_session_key(event.source, thread_sessions_per_user=False) == (
+        f"agent:main:discord:thread:{message.channel.id}:{message.channel.id}"
+    )
     assert event.metadata["discord_handoff"]["handoff_id"] == "H-20260909-001"
     assert "hermes-prod のuptimeを確認" in event.text
 

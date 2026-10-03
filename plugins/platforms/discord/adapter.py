@@ -6102,8 +6102,14 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         # Track participation so follow-ups in this thread don't need @mention.
         if thread_id:
             self._threads.mark(thread_id)
-        # Only live plain text is batched: recovery candidates are complete; coalescing would replay IDs.
-        if (not recovered and msg_type == MessageType.TEXT and self._text_batch_delay_seconds > 0):
+        # Ops handoffs are already complete protocol messages. They must reach their own
+        # thread-scoped session immediately; batching can combine distinct handoff payloads or
+        # delay a result-bound run behind Discord's normal text quiet period.
+        # Recovery candidates are complete too; coalescing would replay message IDs.
+        if (
+            not is_handoff and not recovered
+            and msg_type == MessageType.TEXT and self._text_batch_delay_seconds > 0
+        ):
             self._enqueue_text_event(event)
         else:
             await self.handle_message(event)
