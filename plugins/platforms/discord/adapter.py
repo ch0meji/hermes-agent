@@ -1470,6 +1470,11 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                     return False, False
         return True, role_authorized
 
+    def _release_discord_handoff_claims(self, message_id: str, handoff: OpsHandoff) -> None:
+        """Release both ingress dedupe claims when a trusted handoff was not accepted."""
+        self._dedup.discard(message_id)
+        self._handoff_dedupe.release(message_id, handoff.handoff_id)
+
     async def _dispatch_discord_message(self, message: Any) -> bool:
         """Apply Discord ingress policy and dispatch one live event."""
         if not self._ready_event.is_set():
@@ -1489,14 +1494,12 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 message, role_authorized=role_authorized, handoff=handoff,
             )
         except BaseException:
-            self._dedup.discard(message_id)
-            self._handoff_dedupe.release(message_id, handoff.handoff_id)
+            self._release_discord_handoff_claims(message_id, handoff)
             raise
         if not accepted:
             # Admission claimed both ids before the asynchronous gateway dispatch. A
             # rejected enqueue must leave the original Discord message retryable.
-            self._dedup.discard(message_id)
-            self._handoff_dedupe.release(message_id, handoff.handoff_id)
+            self._release_discord_handoff_claims(message_id, handoff)
         return accepted
 
     # --- gateway_platform_event fire-sites ---
@@ -2271,15 +2274,31 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 and not self._self_is_explicitly_mentioned(message)
             ):
                 return False
-        admitted, role_authorized = self._discord_message_admission(message, claim=False)
+        handoff = (
+            self._parse_discord_handoff(message)
+            if self._is_discord_handoff_channel(message)
+            else None
+        )
+        # Recovery and live ingress must reserve the same handoff/message IDs before
+        # dispatch so only one path can queue a handoff during a reconnect race.
+        admitted, role_authorized = self._discord_message_admission(
+            message, claim=handoff is not None,
+        )
         if not admitted:
             return False
-        handoff = self._parse_discord_handoff(message)
         if handoff is None:
             return await self._handle_message(message, role_authorized=role_authorized, recovered=True)
-        return await self._handle_message(
-            message, role_authorized=role_authorized, recovered=True, handoff=handoff,
-        )
+        message_id = str(getattr(message, "id", ""))
+        try:
+            accepted = await self._handle_message(
+                message, role_authorized=role_authorized, recovered=True, handoff=handoff,
+            )
+        except BaseException:
+            self._release_discord_handoff_claims(message_id, handoff)
+            raise
+        if not accepted:
+            self._release_discord_handoff_claims(message_id, handoff)
+        return accepted
 
     async def _iter_missed_message_backfill_candidates(self, channel_ids: set[str]):
         if not self._client:

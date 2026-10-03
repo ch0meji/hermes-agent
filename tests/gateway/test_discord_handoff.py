@@ -724,6 +724,48 @@ async def test_busy_boundary_handoffs_bypass_clarify_and_run_as_fifo_turns(disco
         accepted_cap_event = discord_adapter._pending_messages[drain_key]
         assert accepted_cap_event.metadata["discord_handoff"]["handoff_id"] == "H-20261003-042"
         assert accepted_cap_event._gateway_accepted is True
+
+        # Recovery reserves the same message and logical handoff claims as live
+        # ingress. A FIFO rejection releases both so a later scan can retry it.
+        recovered_key = hold_discord_thread(41003)
+        discord_adapter._threads._threads["41003"] = None
+        recovered_message = _message(
+            discord_adapter,
+            author_id=1545456768430121022,
+            bot=True,
+            message_id=41003,
+            thread=True,
+            thread_id=41003,
+            handoff_id="H-20261003-043",
+        )
+        runner._BUSY_QUEUE_MAX_PENDING = 0
+
+        assert await discord_adapter._dispatch_recovered_message(recovered_message) is False
+        assert recovered_key not in discord_adapter._pending_messages
+        assert not discord_adapter._dedup.contains(str(recovered_message.id))
+
+        runner._BUSY_QUEUE_MAX_PENDING = 1
+        assert await discord_adapter._dispatch_recovered_message(recovered_message) is True
+        recovered_event = discord_adapter._pending_messages[recovered_key]
+        assert recovered_event.metadata["discord_handoff"]["handoff_id"] == "H-20261003-043"
+        assert recovered_event.message_id == str(recovered_message.id)
+        assert recovered_event._gateway_accepted is True
+
+        # The successful retry keeps duplicate suppression for both the Discord
+        # message ID and the handoff ID, even when Discord gives it a new message ID.
+        assert await discord_adapter._dispatch_recovered_message(recovered_message) is False
+        duplicate_handoff = _message(
+            discord_adapter,
+            author_id=1545456768430121022,
+            bot=True,
+            message_id=41004,
+            thread=True,
+            thread_id=41003,
+            handoff_id="H-20261003-043",
+        )
+        assert await discord_adapter._dispatch_recovered_message(duplicate_handoff) is False
+        assert not discord_adapter._dedup.contains(str(duplicate_handoff.id))
+        assert discord_adapter._pending_messages[recovered_key] is recovered_event
     finally:
         release_active.set()
         await asyncio.gather(*tuple(discord_adapter._background_tasks), return_exceptions=True)
