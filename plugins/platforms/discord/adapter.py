@@ -1407,6 +1407,9 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             if handoff is None or not self._handoff_channel_passes_channel_policy(message):
                 return False, False
             if not self._handoff_dedupe.claim(message_id, handoff.handoff_id):
+                # The logical handoff is already claimed elsewhere; do not strand
+                # this distinct Discord message ID if that claim is later rejected.
+                self._dedup.discard(message_id)
                 return False, False
             return True, False
         # A valid handoff payload outside the dedicated channel must never fall through to a
@@ -1467,6 +1470,11 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                     return False, False
         return True, role_authorized
 
+    def _release_discord_handoff_claims(self, message_id: str, handoff: OpsHandoff) -> None:
+        """Release both ingress dedupe claims when a trusted handoff was not accepted."""
+        self._dedup.discard(message_id)
+        self._handoff_dedupe.release(message_id, handoff.handoff_id)
+
     async def _dispatch_discord_message(self, message: Any) -> bool:
         """Apply Discord ingress policy and dispatch one live event."""
         if not self._ready_event.is_set():
@@ -1480,7 +1488,19 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         handoff = self._parse_discord_handoff(message)
         if handoff is None:
             return await self._handle_message(message, role_authorized=role_authorized)
-        return await self._handle_message(message, role_authorized=role_authorized, handoff=handoff)
+        message_id = str(getattr(message, "id", ""))
+        try:
+            accepted = await self._handle_message(
+                message, role_authorized=role_authorized, handoff=handoff,
+            )
+        except BaseException:
+            self._release_discord_handoff_claims(message_id, handoff)
+            raise
+        if not accepted:
+            # Admission claimed both ids before the asynchronous gateway dispatch. A
+            # rejected enqueue must leave the original Discord message retryable.
+            self._release_discord_handoff_claims(message_id, handoff)
+        return accepted
 
     # --- gateway_platform_event fire-sites ---
 
@@ -2205,6 +2225,10 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                     admitted = await self._dispatch_recovered_message(message)
                     if admitted:
                         counts["dispatched"] += 1
+                    else:
+                        # A downstream FIFO/drain rejection is not outstanding work.
+                        # Clear the durable queued claim so the next recovery scan can retry.
+                        self._record_discord_message_seen(message, status="failed")
                 except asyncio.CancelledError:
                     self._dedup.discard(message_id)
                     self._record_recovery_attempt(message, status="cancelled")
@@ -2254,15 +2278,31 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 and not self._self_is_explicitly_mentioned(message)
             ):
                 return False
-        admitted, role_authorized = self._discord_message_admission(message, claim=False)
+        handoff = (
+            self._parse_discord_handoff(message)
+            if self._is_discord_handoff_channel(message)
+            else None
+        )
+        # Recovery and live ingress must reserve the same handoff/message IDs before
+        # dispatch so only one path can queue a handoff during a reconnect race.
+        admitted, role_authorized = self._discord_message_admission(
+            message, claim=handoff is not None,
+        )
         if not admitted:
             return False
-        handoff = self._parse_discord_handoff(message)
         if handoff is None:
             return await self._handle_message(message, role_authorized=role_authorized, recovered=True)
-        return await self._handle_message(
-            message, role_authorized=role_authorized, recovered=True, handoff=handoff,
-        )
+        message_id = str(getattr(message, "id", ""))
+        try:
+            accepted = await self._handle_message(
+                message, role_authorized=role_authorized, recovered=True, handoff=handoff,
+            )
+        except BaseException:
+            self._release_discord_handoff_claims(message_id, handoff)
+            raise
+        if not accepted:
+            self._release_discord_handoff_claims(message_id, handoff)
+        return accepted
 
     async def _iter_missed_message_backfill_candidates(self, channel_ids: set[str]):
         if not self._client:
@@ -6096,17 +6136,25 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             message_id=str(message.id), media_urls=media_urls, media_types=media_types,
             reply_to_message_id=reply_to_id, reply_to_text=reply_to_text,
             timestamp=message.created_at, auto_skill=_skills, channel_prompt=_channel_prompt,
-            channel_context=_channel_context,
+            channel_context=_channel_context, preserve_message_boundary=is_handoff,
             metadata=event_metadata,
         )
         # Track participation so follow-ups in this thread don't need @mention.
         if thread_id:
             self._threads.mark(thread_id)
-        # Only live plain text is batched: recovery candidates are complete; coalescing would replay IDs.
-        if (not recovered and msg_type == MessageType.TEXT and self._text_batch_delay_seconds > 0):
+        # Ops handoffs are already complete protocol messages. They must reach their own
+        # thread-scoped session immediately; batching can combine distinct handoff payloads or
+        # delay a result-bound run behind Discord's normal text quiet period.
+        # Recovery candidates are complete too; coalescing would replay message IDs.
+        if (
+            not is_handoff and not recovered
+            and msg_type == MessageType.TEXT and self._text_batch_delay_seconds > 0
+        ):
             self._enqueue_text_event(event)
         else:
             await self.handle_message(event)
+        if is_handoff:
+            return bool(getattr(event, "_gateway_accepted", False))
         return True
 
     # ------------------------------------------------------------------

@@ -43,16 +43,17 @@ class GatewayBusySessionMixin:
         state = self._peek_session_state(session_key)
         return state.conversation.queued_events if state else None
 
-    def _enqueue_fifo(self, session_key: str, queued_event: "MessageEvent", adapter: Any) -> None:
+    def _enqueue_fifo(self, session_key: str, queued_event: "MessageEvent", adapter: Any) -> bool:
         """Append a /queue event to the FIFO chain for a session."""
         pending_slot = getattr(adapter, "_pending_messages", None) if adapter is not None else None
-        if pending_slot is None:
-            return
+        if not isinstance(pending_slot, dict):
+            return False
         if session_key in pending_slot:
             self._session_state(session_key).conversation.queued_events.append(queued_event)
         else:
             pending_slot[session_key] = queued_event
         queued_event._gateway_accepted = True
+        return True
 
     def _promote_queued_event(
         self, session_key: str, adapter: Any, pending_event: Optional["MessageEvent"]
@@ -278,11 +279,12 @@ class GatewayBusySessionMixin:
         "gateway_session_id", "gateway_session_strict",
     )
 
-    def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> None:
+    def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> bool:
+        event._gateway_accepted = False
         from gateway.platforms.base import merge_pending_message_event
         adapter = self._adapter_for_source(event.source)
         if not adapter:
-            return
+            return False
         # FIFO so each follow-up gets its own turn in arrival order (the single pending slot used to
         # be silently OVERWRITTEN). Photo bursts still merge into the head slot (album semantics).
         pending_slot = getattr(adapter, "_pending_messages", None)
@@ -300,7 +302,13 @@ class GatewayBusySessionMixin:
                 for key in self._SECURITY_METADATA_KEYS
             )
         )
-        if same_security_context and (
+        has_boundary_event = (
+            bool(getattr(existing, "preserve_message_boundary", False))
+            or bool(getattr(event, "preserve_message_boundary", False))
+        )
+        # Boundaries are protocol semantics; even the usual photo/caption burst
+        # path must keep these events as separate turns in the FIFO.
+        if not has_boundary_event and same_security_context and (
             getattr(existing, "message_type", None) == MessageType.PHOTO
             or event.message_type == MessageType.PHOTO
             or bool(getattr(existing, "media_urls", None))
@@ -312,16 +320,16 @@ class GatewayBusySessionMixin:
                 merge_text=event.message_type == MessageType.TEXT,
             )
             event._gateway_accepted = True
-            return
+            return True
 
         if self._queue_depth(session_key, adapter=adapter) >= self._BUSY_QUEUE_MAX_PENDING:
             logger.warning(
                 "Dropping busy-mode follow-up for session %s — pending queue at cap (%d).",
                 session_key, self._BUSY_QUEUE_MAX_PENDING,
             )
-            return
+            return False
 
-        self._enqueue_fifo(session_key, event, adapter)
+        return self._enqueue_fifo(session_key, event, adapter)
 
     async def _prepare_busy_steer_text(self, event: MessageEvent) -> str:
         """Steerable text for a busy follow-up, transcribing voice-message media first.
@@ -400,17 +408,20 @@ class GatewayBusySessionMixin:
             metadata=self._thread_metadata_for_source(event.source, reply_anchor),
         )
 
-    async def _send_busy_drain_notice(self, event: MessageEvent, session_key: str, effective_mode: str) -> None:
+    async def _send_busy_drain_notice(self, event: MessageEvent, session_key: str, effective_mode: str) -> bool:
         """Busy path while the gateway is restarting/stopping: queue (if allowed) and tell the user."""
         adapter = self._adapter_for_source(event.source)
         if not adapter:
-            return
+            return False
+        queued = False
         if self._queue_during_drain_enabled(effective_mode):
-            self._queue_or_replace_pending_event(session_key, event)
+            queued = self._queue_or_replace_pending_event(session_key, event)
+        if queued:
             message = f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
         else:
             message = f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
         await self._send_busy_reply(event, adapter, message)
+        return queued
 
     # Bare-word approval replies → (verb, args) for the synthesized slash command.
     _PLAINTEXT_APPROVAL_WORDS: Dict[str, tuple] = {
@@ -653,9 +664,10 @@ class GatewayBusySessionMixin:
             logger.debug("Failed to send busy-ack: %s", e)
 
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
+        preserve_boundary = bool(getattr(event, "preserve_message_boundary", False))
         # Gateway wakes have no external user identity. Admit them before auth/drain/approval
         # handling, without merging their text into an already queued human message.
-        if event.internal and event.allow_gateway_control:
+        if event.internal and event.allow_gateway_control and not preserve_boundary:
             adapter = self._adapter_for_source(event.source)
             if adapter and session_key in getattr(adapter, "_pending_messages", {}):
                 self._queue_or_replace_pending_event(session_key, event)
@@ -666,7 +678,7 @@ class GatewayBusySessionMixin:
         # inject messages into a session they don't own.
         from gateway.run import _AGENT_PENDING_SENTINEL
         # See #17775.
-        if not self._is_user_authorized(event.source):
+        if not (event.internal and event.allow_gateway_control) and not self._is_user_authorized(event.source):
             logger.warning(
                 "Dropping message from unauthorized user in active session: "
                 "user=%s (%s), platform=%s, session=%s", event.source.user_id, event.source.user_name,
@@ -674,15 +686,23 @@ class GatewayBusySessionMixin:
             )
             return True  # handled (silently dropped); do not fall through
 
-        effective_mode = self._effective_busy_input_mode(event.source)
-        if self._draining:  # gateway restarting/stopping
-            await self._send_busy_drain_notice(event, session_key, effective_mode)
-            return True
-        if await self._route_plaintext_approval_while_busy(event, session_key):
-            return True
         adapter = self._adapter_for_source(event.source)
         if not adapter:
             return False  # let default path handle it
+
+        # Drain policy applies to complete protocol records too. During restart,
+        # only the existing restart queue policy can accept the event.
+        effective_mode = self._effective_busy_input_mode(event.source)
+        if self._draining:
+            queued = await self._send_busy_drain_notice(event, session_key, effective_mode)
+            return queued if preserve_boundary else True
+        if preserve_boundary:
+            # Protocol events keep their own FIFO entry. This must precede clarify,
+            # approval, steer, debounce, and normal text handling.
+            return self._queue_or_replace_pending_event(session_key, event)
+
+        if await self._route_plaintext_approval_while_busy(event, session_key):
+            return True
         # Internal synthetic events (delegation / background completions) must never interrupt or
         # steer; they surface as a NEW turn when idle. Plugin events carry untrusted payload text, so
         # queue them through the FIFO (security metadata kept apart).
