@@ -6096,7 +6096,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             message_id=str(message.id), media_urls=media_urls, media_types=media_types,
             reply_to_message_id=reply_to_id, reply_to_text=reply_to_text,
             timestamp=message.created_at, auto_skill=_skills, channel_prompt=_channel_prompt,
-            channel_context=_channel_context,
+            channel_context=_channel_context, preserve_message_boundary=is_handoff,
             metadata=event_metadata,
         )
         # Track participation so follow-ups in this thread don't need @mention.

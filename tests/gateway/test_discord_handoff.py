@@ -321,6 +321,7 @@ async def test_nashi_accept_relaxes_mention_and_thread_creation(discord_adapter,
     assert discord_adapter._discord_message_admission(message, claim=True) == (True, False)
     assert await discord_adapter._handle_message(message) is True
     discord_adapter.handle_message.assert_awaited_once()
+    assert discord_adapter.handle_message.await_args.args[0].preserve_message_boundary is False
     discord_adapter._auto_create_thread.assert_not_awaited()
 
 
@@ -511,6 +512,7 @@ async def test_distinct_busy_handoff_ids_stay_separate_fifo_events():
             internal=False,
             message_type=MessageType.TEXT,
             text=f"payload for {handoff_id}",
+            preserve_message_boundary=True,
         )
 
     first = handoff_event("H-20261003-001")
@@ -549,6 +551,7 @@ async def test_valid_handoff_reaches_existing_event_path_and_keeps_thread(discor
         f"agent:main:discord:thread:{message.channel.id}:{message.channel.id}"
     )
     assert event.metadata["discord_handoff"]["handoff_id"] == "H-20260909-001"
+    assert event.preserve_message_boundary is True
     assert "hermes-prod のuptimeを確認" in event.text
 
 

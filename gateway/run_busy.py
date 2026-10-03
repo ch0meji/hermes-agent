@@ -683,18 +683,9 @@ class GatewayBusySessionMixin:
         adapter = self._adapter_for_source(event.source)
         if not adapter:
             return False  # let default path handle it
-        event_metadata = getattr(event, "metadata", None)
-        handoff = event_metadata.get("discord_handoff") if isinstance(event_metadata, dict) else None
-        if (
-            event.source.platform == Platform.DISCORD
-            and getattr(event.source, "trusted_discord_handoff", False) is True
-            and isinstance(handoff, dict)
-            and str(handoff.get("handoff_id") or "").strip()
-        ):
-            # A handoff is a complete, independently correlated job. Never steer it into the
-            # current turn or feed it through the normal text debounce/merge path. FIFO preserves
-            # every event if a sender reuses one Discord thread for multiple IDs; normal
-            # Hatsugarasu traffic uses one thread (and therefore one session) per handoff.
+        if getattr(event, "preserve_message_boundary", False):
+            # Complete protocol events must keep their boundaries. Queue each as its own turn,
+            # independent of the platform-specific adapter that produced it.
             self._queue_or_replace_pending_event(session_key, event)
             return True
         # Internal synthetic events (delegation / background completions) must never interrupt or
