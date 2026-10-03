@@ -439,7 +439,9 @@ async def test_handoff_dispatch_bypasses_text_batch_and_runs_one_two_or_five_thr
 
 
 @pytest.mark.asyncio
-async def test_busy_boundary_handoffs_bypass_clarify_and_run_as_fifo_turns(discord_adapter):
+async def test_busy_boundary_handoffs_bypass_clarify_and_run_as_fifo_turns(
+    discord_adapter, monkeypatch,
+):
     """A pending clarify cannot consume or merge handoffs arriving during an active turn."""
     class FakeRunner(GatewayBusySessionMixin):
         _BUSY_QUEUE_MAX_PENDING = 8
@@ -766,6 +768,46 @@ async def test_busy_boundary_handoffs_bypass_clarify_and_run_as_fifo_turns(disco
         assert await discord_adapter._dispatch_recovered_message(duplicate_handoff) is False
         assert not discord_adapter._dedup.contains(str(duplicate_handoff.id))
         assert discord_adapter._pending_messages[recovered_key] is recovered_event
+
+        # A recovery scan's durable queued marker must also be cleared when the
+        # gateway rejects dispatch, otherwise it suppresses retries for ten minutes.
+        monkeypatch.setenv("DISCORD_MISSED_MESSAGE_BACKFILL", "true")
+        scan_key = hold_discord_thread(41005)
+        discord_adapter._threads._threads["41005"] = None
+        scan_message = _message(
+            discord_adapter,
+            author_id=1545456768430121022,
+            bot=True,
+            message_id=41005,
+            thread=True,
+            thread_id=41005,
+            handoff_id="H-20261003-045",
+        )
+
+        async def candidates(_channel_ids):
+            yield scan_message
+
+        monkeypatch.setattr(discord_adapter, "_missed_message_backfill_channels", lambda: {"18765"})
+        monkeypatch.setattr(discord_adapter, "_with_discord_recovery_db_async", AsyncMock(return_value=True))
+        monkeypatch.setattr(discord_adapter, "_record_recovery_scan_start", Mock(return_value="scan-id"))
+        monkeypatch.setattr(discord_adapter, "_finish_recovery_scan", AsyncMock())
+        monkeypatch.setattr(discord_adapter, "_iter_missed_message_backfill_candidates", candidates)
+        monkeypatch.setattr(discord_adapter, "_should_backfill_discord_message", AsyncMock(return_value=True))
+        recovery_status = Mock()
+        monkeypatch.setattr(discord_adapter, "_record_discord_message_seen", recovery_status)
+        monkeypatch.setattr(discord_adapter, "_record_recovery_attempt", Mock())
+        runner._BUSY_QUEUE_MAX_PENDING = 0
+
+        await discord_adapter._run_missed_message_backfill()
+        recovery_status.assert_any_call(scan_message, status="failed")
+        assert scan_key not in discord_adapter._pending_messages
+        assert not discord_adapter._dedup.contains(str(scan_message.id))
+
+        runner._BUSY_QUEUE_MAX_PENDING = 1
+        assert await discord_adapter._dispatch_recovered_message(scan_message) is True
+        assert discord_adapter._pending_messages[scan_key].metadata["discord_handoff"]["handoff_id"] == (
+            "H-20261003-045"
+        )
     finally:
         release_active.set()
         await asyncio.gather(*tuple(discord_adapter._background_tasks), return_exceptions=True)

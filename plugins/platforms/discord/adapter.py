@@ -2225,6 +2225,10 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                     admitted = await self._dispatch_recovered_message(message)
                     if admitted:
                         counts["dispatched"] += 1
+                    else:
+                        # A downstream FIFO/drain rejection is not outstanding work.
+                        # Clear the durable queued claim so the next recovery scan can retry.
+                        self._record_discord_message_seen(message, status="failed")
                 except asyncio.CancelledError:
                     self._dedup.discard(message_id)
                     self._record_recovery_attempt(message, status="cancelled")
