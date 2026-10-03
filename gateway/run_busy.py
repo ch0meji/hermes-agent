@@ -300,7 +300,13 @@ class GatewayBusySessionMixin:
                 for key in self._SECURITY_METADATA_KEYS
             )
         )
-        if same_security_context and (
+        has_boundary_event = (
+            bool(getattr(existing, "preserve_message_boundary", False))
+            or bool(getattr(event, "preserve_message_boundary", False))
+        )
+        # Boundaries are protocol semantics; even the usual photo/caption burst
+        # path must keep these events as separate turns in the FIFO.
+        if not has_boundary_event and same_security_context and (
             getattr(existing, "message_type", None) == MessageType.PHOTO
             or event.message_type == MessageType.PHOTO
             or bool(getattr(existing, "media_urls", None))
@@ -674,15 +680,21 @@ class GatewayBusySessionMixin:
             )
             return True  # handled (silently dropped); do not fall through
 
+        adapter = self._adapter_for_source(event.source)
+        if not adapter:
+            return False  # let default path handle it
+        if getattr(event, "preserve_message_boundary", False):
+            # Protocol events keep their own FIFO entry. This must precede clarify,
+            # approval, steer, debounce, and normal text handling.
+            self._queue_or_replace_pending_event(session_key, event)
+            return True
+
         effective_mode = self._effective_busy_input_mode(event.source)
         if self._draining:  # gateway restarting/stopping
             await self._send_busy_drain_notice(event, session_key, effective_mode)
             return True
         if await self._route_plaintext_approval_while_busy(event, session_key):
             return True
-        adapter = self._adapter_for_source(event.source)
-        if not adapter:
-            return False  # let default path handle it
         # Internal synthetic events (delegation / background completions) must never interrupt or
         # steer; they surface as a NEW turn when idle. Plugin events carry untrusted payload text, so
         # queue them through the FIFO (security metadata kept apart).

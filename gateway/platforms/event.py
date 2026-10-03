@@ -81,8 +81,12 @@ class MessageEvent:
     metadata: Dict[str, Any] = field(default_factory=dict)
     timestamp: datetime = field(default_factory=datetime.now)
     # May this event resolve gateway commands / control prompts? Proactive plugin events set False
-    # so untrusted payload text stays conversational. Kept last for positional compat.
+    # so untrusted payload text stays conversational.
     allow_gateway_control: bool = True
+    # Some platform messages are complete protocol records whose boundaries must survive busy
+    # session handling. When set, queue as an individual FIFO event instead of steering, debouncing,
+    # or merging it with adjacent text.
+    preserve_message_boundary: bool = False
 
     # Process-local admission receipt, never routing metadata or execution acknowledgement.
     _gateway_accepted: bool = field(default=False, init=False, repr=False, compare=False)
