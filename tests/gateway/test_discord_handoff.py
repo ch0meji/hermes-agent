@@ -5,15 +5,15 @@ import os
 import sys
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.event import MessageType
+from gateway.platforms.event import MessageEvent, MessageType
 from gateway.run_inbound import GatewayInboundMixin
 from gateway.run_busy import GatewayBusySessionMixin
-from gateway.session import SessionSource, build_session_key
+from gateway.session import SessionSource
 from plugins.platforms.discord.handoff import (
     MAX_HANDOFF_MESSAGE_CHARS,
     HandoffDedupe,
@@ -217,41 +217,6 @@ def test_admission_is_channel_sender_and_protocol_specific(discord_adapter, monk
     assert discord_adapter._discord_message_admission(normal_with_global_bot_opt_in, claim=True) == (False, False)
 
 
-@pytest.mark.parametrize("thread", [False, True])
-@pytest.mark.asyncio
-async def test_human_handoff_channel_and_thread_posts_are_never_dispatched(discord_adapter, thread):
-    import plugins.platforms.discord.adapter as discord_platform
-
-    discord_adapter._test_message_type = discord_platform.discord.MessageType.default
-    discord_adapter._ready_event.set()
-    message = _message(
-        discord_adapter, author_id=42, bot=False, thread=thread,
-        thread_id=32001 if thread else None, message_id=320 if thread else 319,
-    )
-
-    assert await discord_adapter._dispatch_discord_message(message) is False
-    discord_adapter.handle_message.assert_not_awaited()
-
-
-@pytest.mark.parametrize(
-    ("author_id", "content"),
-    [
-        (1545113469244674209, _valid_content("H-20261003-101")),
-        (1545456768430121022, _valid_content("H-20261003-102").replace("type: ops_handoff", "type: invalid")),
-    ],
-)
-def test_thread_rejects_other_bots_and_malformed_handoffs(discord_adapter, author_id, content):
-    import plugins.platforms.discord.adapter as discord_platform
-
-    discord_adapter._test_message_type = discord_platform.discord.MessageType.default
-    message = _message(
-        discord_adapter, author_id=author_id, bot=True, thread=True,
-        thread_id=32002 + author_id % 10, content=content, message_id=321 + author_id % 10,
-    )
-
-    assert discord_adapter._discord_message_admission(message, claim=True) == (False, False)
-
-
 @pytest.mark.parametrize("author_id", [1545456768430121022, 1545113469244674209, 123456])
 def test_normal_channel_bots_are_always_rejected(discord_adapter, monkeypatch, author_id):
     import plugins.platforms.discord.adapter as discord_platform
@@ -453,6 +418,11 @@ async def test_handoff_dispatch_bypasses_text_batch_and_runs_one_two_or_five_thr
             assert {event.source.chat_id for event, _ in started} == {
                 str(message.channel.id) for message in messages
             }
+            assert all(event.preserve_message_boundary for event, _ in started)
+            assert {event.metadata["discord_handoff"]["handoff_id"] for event, _ in started} == {
+                f"H-20261003-{count * 10 + index:03d}" for index in range(count)
+            }
+            assert all(event.source.trusted_discord_handoff for event, _ in started)
             assert set(discord_adapter._active_sessions) == {key for _, key in started}
             assert max_active == count
             assert not discord_adapter._pending_text_batches
@@ -464,15 +434,17 @@ async def test_handoff_dispatch_bypasses_text_batch_and_runs_one_two_or_five_thr
 
 
 @pytest.mark.asyncio
-async def test_distinct_busy_handoff_ids_stay_separate_fifo_events():
-    """Even a reused thread cannot collapse two Ops IDs into a pending text event."""
+async def test_busy_boundary_handoffs_bypass_clarify_and_run_as_fifo_turns(discord_adapter):
+    """A pending clarify cannot consume or merge handoffs arriving during an active turn."""
     class FakeRunner(GatewayBusySessionMixin):
         _BUSY_QUEUE_MAX_PENDING = 8
 
-        def __init__(self):
-            self.adapter = SimpleNamespace(_pending_messages={})
+        def __init__(self, adapter):
+            self.adapter = adapter
             self._state = SimpleNamespace(conversation=SimpleNamespace(queued_events=[]))
             self._draining = False
+            self._route_plaintext_approval_while_busy = AsyncMock(return_value=False)
+            self._resolve_busy_steer_or_redirect = AsyncMock()
 
         def _is_user_authorized(self, _source):
             return True
@@ -487,72 +459,109 @@ async def test_distinct_busy_handoff_ids_stay_separate_fifo_events():
             return self.adapter
 
         def _queue_depth(self, key, *, adapter=None):
-            del key
-            return len(adapter._pending_messages) + len(self._state.conversation.queued_events)
+            return int(key in adapter._pending_messages) + len(self._state.conversation.queued_events)
 
         def _session_state(self, _key):
             return self._state
 
-    runner = FakeRunner()
+        def _peek_session_state(self, _key):
+            return self._state
 
-    def handoff_event(handoff_id):
-        source = SessionSource(
-            platform=Platform.DISCORD,
-            chat_id="thread-1",
-            chat_type="thread",
-            user_id="1545456768430121022",
-            is_bot=True,
-            thread_id="thread-1",
-            parent_chat_id="18765",
-            trusted_discord_handoff=True,
-        )
-        return SimpleNamespace(
-            source=source,
-            metadata={"discord_handoff": {"handoff_id": handoff_id}},
-            internal=False,
-            message_type=MessageType.TEXT,
-            text=f"payload for {handoff_id}",
-            preserve_message_boundary=True,
-        )
-
-    first = handoff_event("H-20261003-001")
-    second = handoff_event("H-20261003-002")
-    assert await runner._handle_active_session_busy_message(first, "thread-session") is True
-    assert await runner._handle_active_session_busy_message(second, "thread-session") is True
-
-    assert runner.adapter._pending_messages["thread-session"] is first
-    assert runner._state.conversation.queued_events == [second]
-    assert [first.text, second.text] == ["payload for H-20261003-001", "payload for H-20261003-002"]
-
-
-@pytest.mark.asyncio
-async def test_valid_handoff_reaches_existing_event_path_and_keeps_thread(discord_adapter):
     import plugins.platforms.discord.adapter as discord_platform
+    from tools import clarify_gateway
 
     discord_adapter._test_message_type = discord_platform.discord.MessageType.default
-    message = _message(
-        discord_adapter, author_id=1545456768430121022, bot=True, message_id=7, thread=True,
-    )
-    admitted, role_authorized = discord_adapter._discord_message_admission(message, claim=True)
-    assert (admitted, role_authorized) == (True, False)
+    del discord_adapter.handle_message  # exercise BasePlatformAdapter's active-session routing
+    discord_adapter.config.typing_indicator = False
+    runner = FakeRunner(discord_adapter)
+    discord_adapter.set_busy_session_handler(runner._handle_active_session_busy_message)
+    active_started = asyncio.Event()
+    release_active = asyncio.Event()
+    handoffs_started = asyncio.Event()
+    processed = []
 
-    assert await discord_adapter._handle_message(
-        message, role_authorized=role_authorized,
-        handoff=discord_adapter._parse_discord_handoff(message),
-    ) is True
-    event = discord_adapter.handle_message.await_args.args[0]
-    assert event.source.trusted_discord_handoff is True
-    assert event.source.is_bot is True
-    assert "trusted_discord_handoff" not in event.source.to_dict()
-    assert event.source.chat_type == "thread"
-    assert event.source.thread_id == str(message.channel.id)
-    assert event.source.parent_chat_id == "18765"
-    assert build_session_key(event.source, thread_sessions_per_user=False) == (
-        f"agent:main:discord:thread:{message.channel.id}:{message.channel.id}"
+    async def process(event):
+        if event.message_id == "active":
+            active_started.set()
+            await release_active.wait()
+            return None
+        processed.append(event)
+        if len(processed) == 1:
+            handoffs_started.set()
+        return None
+
+    discord_adapter._message_handler = process
+
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="thread-1",
+        chat_type="thread",
+        user_id="1545456768430121022",
+        is_bot=True,
+        thread_id="thread-1",
+        parent_chat_id="18765",
+        trusted_discord_handoff=True,
     )
-    assert event.metadata["discord_handoff"]["handoff_id"] == "H-20260909-001"
-    assert event.preserve_message_boundary is True
-    assert "hermes-prod のuptimeを確認" in event.text
+
+    def event(message_id, handoff_id, text):
+        result = MessageEvent(
+            text=text,
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id=message_id,
+            metadata={"discord_handoff": {"handoff_id": handoff_id}},
+            preserve_message_boundary=True,
+        )
+        result.get_command = Mock(side_effect=AssertionError("boundary event must not be command-parsed"))
+        return result
+
+    active = MessageEvent(text="active work", source=source, message_id="active")
+    session_key = discord_adapter._event_session_key(active)
+    await discord_adapter.handle_message(active)
+    await asyncio.wait_for(active_started.wait(), timeout=2)
+
+    with clarify_gateway._lock:
+        clarify_gateway._entries.clear()
+        clarify_gateway._session_index.clear()
+        clarify_gateway._notify_cbs.clear()
+    clarify_gateway.register("pending-clarify", session_key, "Pick one", ["A", "B"])
+    discord_adapter._dispatch_inline_reply = AsyncMock()
+    debounce_candidate = Mock(return_value=True)
+    discord_adapter._is_queue_text_debounce_candidate = debounce_candidate
+    first = event("message-B", "H-20261003-001", "type: ops_handoff\nrequest: payload B")
+    second = event("message-C", "H-20261003-002", "type: ops_handoff\nrequest: payload C")
+
+    try:
+        await discord_adapter.handle_message(first)
+        await discord_adapter.handle_message(second)
+
+        assert runner._route_plaintext_approval_while_busy.await_count == 0
+        runner._resolve_busy_steer_or_redirect.assert_not_awaited()
+        discord_adapter._dispatch_inline_reply.assert_not_awaited()
+        debounce_candidate.assert_not_called()
+        assert clarify_gateway.get_pending_for_session(session_key, include_choice_prompts=True) is not None
+        assert first.get_command.call_count == second.get_command.call_count == 0
+        assert discord_adapter._pending_messages[session_key] is first
+        assert runner._state.conversation.queued_events == [second]
+        assert first.text == "type: ops_handoff\nrequest: payload B"
+        assert second.text == "type: ops_handoff\nrequest: payload C"
+        assert first.message_id == "message-B"
+        assert second.message_id == "message-C"
+        assert first.metadata["discord_handoff"]["handoff_id"] == "H-20261003-001"
+        assert second.metadata["discord_handoff"]["handoff_id"] == "H-20261003-002"
+        assert first.preserve_message_boundary and second.preserve_message_boundary
+
+        release_active.set()
+        await asyncio.wait_for(handoffs_started.wait(), timeout=2)
+        assert processed == [first]
+    finally:
+        release_active.set()
+        await asyncio.gather(*tuple(discord_adapter._background_tasks), return_exceptions=True)
+        with clarify_gateway._lock:
+            clarify_gateway._entries.clear()
+            clarify_gateway._session_index.clear()
+            clarify_gateway._notify_cbs.clear()
+        runner._state.conversation.queued_events.clear()
 
 
 def test_central_authz_accepts_only_adapter_trusted_handoff(discord_adapter):

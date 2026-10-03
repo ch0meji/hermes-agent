@@ -674,19 +674,20 @@ class GatewayBusySessionMixin:
             )
             return True  # handled (silently dropped); do not fall through
 
+        adapter = self._adapter_for_source(event.source)
+        if not adapter:
+            return False  # let default path handle it
+        if getattr(event, "preserve_message_boundary", False):
+            # Protocol events keep their own FIFO entry. This must precede clarify,
+            # approval, steer, debounce, and normal text handling.
+            self._queue_or_replace_pending_event(session_key, event)
+            return True
+
         effective_mode = self._effective_busy_input_mode(event.source)
         if self._draining:  # gateway restarting/stopping
             await self._send_busy_drain_notice(event, session_key, effective_mode)
             return True
         if await self._route_plaintext_approval_while_busy(event, session_key):
-            return True
-        adapter = self._adapter_for_source(event.source)
-        if not adapter:
-            return False  # let default path handle it
-        if getattr(event, "preserve_message_boundary", False):
-            # Complete protocol events must keep their boundaries. Queue each as its own turn,
-            # independent of the platform-specific adapter that produced it.
-            self._queue_or_replace_pending_event(session_key, event)
             return True
         # Internal synthetic events (delegation / background completions) must never interrupt or
         # steer; they surface as a NEW turn when idle. Plugin events carry untrusted payload text, so
