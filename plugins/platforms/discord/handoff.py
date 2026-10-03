@@ -264,6 +264,14 @@ class HandoffDedupe:
         self._trim(self._handoff_ids)
         return True
 
+    def release(self, message_id: object, handoff_id: str) -> None:
+        """Release both admission claims when downstream dispatch rejects the event."""
+        message_key = str(message_id or "").strip()
+        if message_key:
+            self._message_ids.pop(message_key, None)
+        if handoff_id:
+            self._handoff_ids.pop(handoff_id, None)
+
     def _trim(self, store: dict[str, None]) -> None:
         while len(store) > self._max_entries:
             store.pop(next(iter(store)))

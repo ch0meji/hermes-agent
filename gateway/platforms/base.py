@@ -3513,14 +3513,17 @@ class BasePlatformAdapter(ABC):
         if getattr(event, "preserve_message_boundary", False):
             if self._busy_session_handler is not None:
                 try:
-                    if await self._busy_session_handler(event, session_key):
-                        return
+                    # The handler's result is the admission receipt for strict-boundary
+                    # events. False means rejected (for example, drain policy or FIFO cap);
+                    # do not silently accept them into the adapter's non-durable fallback.
+                    await self._busy_session_handler(event, session_key)
                 except Exception as e:
                     logger.error("[%s] Boundary-preserving busy event could not be queued: %s",
                                  self.name, e, exc_info=True)
+                return
             # A configured GatewayRunner handles these through its independent
-            # FIFO. Keep the adapter fallback non-merging as well; never reinterpret
-            # protocol content as a command or clarify answer.
+            # FIFO. With no runner hook, keep a one-event adapter fallback non-merging;
+            # never reinterpret protocol content as a command or clarify answer.
             if session_key not in self._pending_messages:
                 self._pending_messages[session_key] = event
                 event._gateway_accepted = True

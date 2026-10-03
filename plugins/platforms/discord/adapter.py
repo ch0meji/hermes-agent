@@ -1407,6 +1407,9 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             if handoff is None or not self._handoff_channel_passes_channel_policy(message):
                 return False, False
             if not self._handoff_dedupe.claim(message_id, handoff.handoff_id):
+                # The logical handoff is already claimed elsewhere; do not strand
+                # this distinct Discord message ID if that claim is later rejected.
+                self._dedup.discard(message_id)
                 return False, False
             return True, False
         # A valid handoff payload outside the dedicated channel must never fall through to a
@@ -1480,7 +1483,21 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         handoff = self._parse_discord_handoff(message)
         if handoff is None:
             return await self._handle_message(message, role_authorized=role_authorized)
-        return await self._handle_message(message, role_authorized=role_authorized, handoff=handoff)
+        message_id = str(getattr(message, "id", ""))
+        try:
+            accepted = await self._handle_message(
+                message, role_authorized=role_authorized, handoff=handoff,
+            )
+        except BaseException:
+            self._dedup.discard(message_id)
+            self._handoff_dedupe.release(message_id, handoff.handoff_id)
+            raise
+        if not accepted:
+            # Admission claimed both ids before the asynchronous gateway dispatch. A
+            # rejected enqueue must leave the original Discord message retryable.
+            self._dedup.discard(message_id)
+            self._handoff_dedupe.release(message_id, handoff.handoff_id)
+        return accepted
 
     # --- gateway_platform_event fire-sites ---
 
@@ -6113,6 +6130,8 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             self._enqueue_text_event(event)
         else:
             await self.handle_message(event)
+        if is_handoff:
+            return bool(getattr(event, "_gateway_accepted", False))
         return True
 
     # ------------------------------------------------------------------

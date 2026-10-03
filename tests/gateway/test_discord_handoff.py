@@ -348,6 +348,11 @@ async def test_dispatch_dedupes_discord_message_and_handoff_id(discord_adapter):
 
     discord_adapter._test_message_type = discord_platform.discord.MessageType.default
     discord_adapter._ready_event.set()
+
+    async def accept_handoff(event):
+        event._gateway_accepted = True
+
+    discord_adapter.handle_message.side_effect = accept_handoff
     first = _message(
         discord_adapter, author_id=1545456768430121022, bot=True, message_id=21,
         thread=True, thread_id=31001,
@@ -443,8 +448,10 @@ async def test_busy_boundary_handoffs_bypass_clarify_and_run_as_fifo_turns(disco
             self.adapter = adapter
             self._state = SimpleNamespace(conversation=SimpleNamespace(queued_events=[]))
             self._draining = False
+            self._restart_requested = False
             self._route_plaintext_approval_while_busy = AsyncMock(return_value=False)
             self._resolve_busy_steer_or_redirect = AsyncMock()
+            self._status_action_gerund = lambda: "restarting"
 
         def _is_user_authorized(self, _source):
             return True
@@ -466,6 +473,14 @@ async def test_busy_boundary_handoffs_bypass_clarify_and_run_as_fifo_turns(disco
 
         def _peek_session_state(self, _key):
             return self._state
+
+        @staticmethod
+        def _reply_anchor_for_event(event):
+            return event.message_id
+
+        @staticmethod
+        def _thread_metadata_for_source(source, _reply_anchor=None):
+            return {"thread_id": source.thread_id} if source.thread_id else None
 
     import plugins.platforms.discord.adapter as discord_platform
     from tools import clarify_gateway
@@ -491,6 +506,7 @@ async def test_busy_boundary_handoffs_bypass_clarify_and_run_as_fifo_turns(disco
         return None
 
     discord_adapter._message_handler = process
+    discord_adapter._send_with_retry = AsyncMock()
 
     source = SessionSource(
         platform=Platform.DISCORD,
@@ -515,6 +531,24 @@ async def test_busy_boundary_handoffs_bypass_clarify_and_run_as_fifo_turns(disco
         )
         result.get_command = Mock(side_effect=AssertionError("boundary event must not be command-parsed"))
         return result
+
+    def source_for_discord_thread(thread_id):
+        return SessionSource(
+            platform=Platform.DISCORD,
+            chat_id=str(thread_id),
+            chat_type="thread",
+            user_id="1545456768430121022",
+            is_bot=True,
+            thread_id=str(thread_id),
+            parent_chat_id="18765",
+            trusted_discord_handoff=True,
+        )
+
+    def hold_discord_thread(thread_id):
+        source = source_for_discord_thread(thread_id)
+        key = discord_adapter._event_session_key(MessageEvent(text="", source=source))
+        discord_adapter._active_sessions[key] = asyncio.Event()
+        return key
 
     active = MessageEvent(text="active work", source=source, message_id="active")
     session_key = discord_adapter._event_session_key(active)
@@ -638,6 +672,58 @@ async def test_busy_boundary_handoffs_bypass_clarify_and_run_as_fifo_turns(disco
         assert regular_photo.media_types == ["image/jpeg", "image/jpeg"]
         assert "first photo" in regular_photo.text and "second photo" in regular_photo.text
         assert runner._state.conversation.queued_events == []
+
+        # A drain without the restart queue policy rejects the boundary event
+        # without consuming either dedupe claim. Retrying the same Discord
+        # message while restart queueing is enabled then succeeds.
+        discord_adapter._ready_event.set()
+        drain_message = _message(
+            discord_adapter,
+            author_id=1545456768430121022,
+            bot=True,
+            message_id=41001,
+            thread=True,
+            thread_id=41001,
+            handoff_id="H-20261003-041",
+        )
+        drain_key = hold_discord_thread(41001)
+        runner._draining = True
+        runner._restart_requested = False
+
+        assert await discord_adapter._dispatch_discord_message(drain_message) is False
+        assert drain_key not in discord_adapter._pending_messages
+        assert not discord_adapter._dedup.contains(str(drain_message.id))
+
+        runner._restart_requested = True
+        assert await discord_adapter._dispatch_discord_message(drain_message) is True
+        accepted_drain_event = discord_adapter._pending_messages[drain_key]
+        assert accepted_drain_event.metadata["discord_handoff"]["handoff_id"] == "H-20261003-041"
+        assert accepted_drain_event._gateway_accepted is True
+
+        # FIFO-cap rejection also releases the message and handoff claims so
+        # the same Discord message can be retried after capacity becomes free.
+        cap_message = _message(
+            discord_adapter,
+            author_id=1545456768430121022,
+            bot=True,
+            message_id=41002,
+            thread=True,
+            thread_id=41001,
+            handoff_id="H-20261003-042",
+        )
+        runner._draining = False
+        runner._restart_requested = False
+        runner._BUSY_QUEUE_MAX_PENDING = 1
+
+        assert await discord_adapter._dispatch_discord_message(cap_message) is False
+        assert discord_adapter._pending_messages[drain_key] is accepted_drain_event
+        assert not discord_adapter._dedup.contains(str(cap_message.id))
+
+        discord_adapter._pending_messages.pop(drain_key)
+        assert await discord_adapter._dispatch_discord_message(cap_message) is True
+        accepted_cap_event = discord_adapter._pending_messages[drain_key]
+        assert accepted_cap_event.metadata["discord_handoff"]["handoff_id"] == "H-20261003-042"
+        assert accepted_cap_event._gateway_accepted is True
     finally:
         release_active.set()
         await asyncio.gather(*tuple(discord_adapter._background_tasks), return_exceptions=True)
