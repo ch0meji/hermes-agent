@@ -300,7 +300,13 @@ class GatewayBusySessionMixin:
                 for key in self._SECURITY_METADATA_KEYS
             )
         )
-        if same_security_context and (
+        has_boundary_event = (
+            bool(getattr(existing, "preserve_message_boundary", False))
+            or bool(getattr(event, "preserve_message_boundary", False))
+        )
+        # Boundaries are protocol semantics; even the usual photo/caption burst
+        # path must keep these events as separate turns in the FIFO.
+        if not has_boundary_event and same_security_context and (
             getattr(existing, "message_type", None) == MessageType.PHOTO
             or event.message_type == MessageType.PHOTO
             or bool(getattr(existing, "media_urls", None))

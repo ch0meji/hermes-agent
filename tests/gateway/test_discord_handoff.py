@@ -503,12 +503,13 @@ async def test_busy_boundary_handoffs_bypass_clarify_and_run_as_fifo_turns(disco
         trusted_discord_handoff=True,
     )
 
-    def event(message_id, handoff_id, text):
+    def event(message_id, handoff_id, text, *, media_urls=None):
         result = MessageEvent(
             text=text,
             message_type=MessageType.TEXT,
             source=source,
             message_id=message_id,
+            media_urls=media_urls or [],
             metadata={"discord_handoff": {"handoff_id": handoff_id}},
             preserve_message_boundary=True,
         )
@@ -554,6 +555,89 @@ async def test_busy_boundary_handoffs_bypass_clarify_and_run_as_fifo_turns(disco
         release_active.set()
         await asyncio.wait_for(handoffs_started.wait(), timeout=2)
         assert processed == [first]
+
+        # A queued PHOTO is an existing head slot. A media-bearing boundary event
+        # must remain an independent FIFO event rather than becoming its caption.
+        runner._state.conversation.queued_events.clear()
+        media_session_key = f"{session_key}:media-merge-check"
+        photo = MessageEvent(
+            text="photo caption",
+            message_type=MessageType.PHOTO,
+            source=source,
+            message_id="photo-message",
+            media_urls=["photo.jpg"],
+        )
+        discord_adapter._pending_messages[media_session_key] = photo
+        media_handoff = event(
+            "message-media-handoff",
+            "H-20261003-003",
+            "type: ops_handoff\nrequest: payload with media",
+            media_urls=["handoff-attachment.bin"],
+        )
+        runner._queue_or_replace_pending_event(media_session_key, media_handoff)
+
+        assert discord_adapter._pending_messages[media_session_key] is photo
+        assert photo.text == "photo caption"
+        assert photo.media_urls == ["photo.jpg"]
+        assert runner._state.conversation.queued_events == [media_handoff]
+        assert media_handoff.text == "type: ops_handoff\nrequest: payload with media"
+        assert media_handoff.message_id == "message-media-handoff"
+        assert media_handoff.metadata["discord_handoff"]["handoff_id"] == "H-20261003-003"
+        assert media_handoff.media_urls == ["handoff-attachment.bin"]
+        assert media_handoff.preserve_message_boundary is True
+
+        # The boundary is strict in both directions: ordinary media arriving
+        # behind a boundary event also stays separate.
+        runner._state.conversation.queued_events.clear()
+        discord_adapter._pending_messages.pop(media_session_key)
+        existing_handoff = event(
+            "message-existing-boundary",
+            "H-20261003-004",
+            "type: ops_handoff\nrequest: existing payload",
+        )
+        discord_adapter._pending_messages[media_session_key] = existing_handoff
+        incoming_photo = MessageEvent(
+            text="later photo caption",
+            message_type=MessageType.PHOTO,
+            source=source,
+            message_id="later-photo-message",
+            media_urls=["later.jpg"],
+        )
+        runner._queue_or_replace_pending_event(media_session_key, incoming_photo)
+
+        assert discord_adapter._pending_messages[media_session_key] is existing_handoff
+        assert existing_handoff.text == "type: ops_handoff\nrequest: existing payload"
+        assert existing_handoff.metadata["discord_handoff"]["handoff_id"] == "H-20261003-004"
+        assert runner._state.conversation.queued_events == [incoming_photo]
+
+        # Ordinary photo bursts still merge when neither event carries a strict
+        # message boundary.
+        runner._state.conversation.queued_events.clear()
+        discord_adapter._pending_messages.pop(media_session_key)
+        regular_photo = MessageEvent(
+            text="first photo",
+            message_type=MessageType.PHOTO,
+            source=source,
+            message_id="regular-photo-1",
+            media_urls=["regular-a.jpg"],
+            media_types=["image/jpeg"],
+        )
+        second_regular_photo = MessageEvent(
+            text="second photo",
+            message_type=MessageType.PHOTO,
+            source=source,
+            message_id="regular-photo-2",
+            media_urls=["regular-b.jpg"],
+            media_types=["image/jpeg"],
+        )
+        runner._queue_or_replace_pending_event(media_session_key, regular_photo)
+        runner._queue_or_replace_pending_event(media_session_key, second_regular_photo)
+
+        assert discord_adapter._pending_messages[media_session_key] is regular_photo
+        assert regular_photo.media_urls == ["regular-a.jpg", "regular-b.jpg"]
+        assert regular_photo.media_types == ["image/jpeg", "image/jpeg"]
+        assert "first photo" in regular_photo.text and "second photo" in regular_photo.text
+        assert runner._state.conversation.queued_events == []
     finally:
         release_active.set()
         await asyncio.gather(*tuple(discord_adapter._background_tasks), return_exceptions=True)
