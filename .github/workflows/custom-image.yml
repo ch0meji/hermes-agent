@@ -33,11 +33,13 @@ env:
 jobs:
   publish:
     name: Build and publish custom image
-    if: github.ref == 'refs/heads/main'
+    # Pushes publish only trusted main. A deliberate manual dispatch can build
+    # a feature ref for staged self-deployment without merging it first.
+    if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - name: Check out trusted main
+      - name: Check out selected source ref
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Set up Docker Buildx
@@ -58,9 +60,11 @@ jobs:
           file: Dockerfile
           platforms: ${{ env.TARGET_PLATFORM }}
           push: true
+          # Feature-branch dispatches publish only the immutable SHA tag;
+          # reserve the floating latest tag for trusted main pushes.
           tags: |
             ${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
-            ${{ env.IMAGE_NAME }}:latest
+            ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && format('{0}:latest', env.IMAGE_NAME) || '' }}
           labels: |
             org.opencontainers.image.source=https://github.com/ch0meji/hermes-agent
             org.opencontainers.image.revision=${{ github.sha }}
@@ -89,6 +93,18 @@ jobs:
 
       - name: Verify Hermes CLI startup
         run: docker run --rm --entrypoint /opt/hermes/.venv/bin/hermes "${IMAGE_NAME}:sha-${GITHUB_SHA}" --version
+
+      - name: Verify runtime tools on the Hermes user's PATH
+        run: |
+          set -euo pipefail
+          docker run --rm --user hermes --env PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin --entrypoint /bin/sh "${IMAGE_NAME}:sha-${GITHUB_SHA}" -ec '
+            test "$(id -un)" = hermes
+            for tool in gh jq rsync hermes; do command -v "$tool" >/dev/null; done
+            hermes --version >/dev/null
+            gh --version >/dev/null
+            jq --version >/dev/null
+            rsync --version >/dev/null
+          '
 
       - name: Write published digest summary
         env:
