@@ -475,6 +475,42 @@ class TestNonStreamingDisconnectCleanup:
         abandon.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_transport_disappearing_counts_as_disconnect(self, adapter):
+        """aiohttp may clear request.transport after connection_lost."""
+        started = asyncio.Event()
+
+        async def fake_run_agent(*, agent_ref=None, **_kwargs):
+            if agent_ref is not None:
+                agent_ref[0] = types.SimpleNamespace()
+            started.set()
+            await asyncio.Event().wait()
+
+        initial_transport = MagicMock()
+        initial_transport.is_closing.return_value = False
+        request = types.SimpleNamespace(transport=initial_transport)
+
+        async def fake_abandon(_agent_ref, agent_task, reason, **_kwargs):
+            assert reason == "HTTP client disconnected"
+            if not agent_task.done():
+                agent_task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await agent_task
+
+        with (
+            patch.object(adapter, "_run_agent", side_effect=fake_run_agent),
+            patch("gateway.platforms.api_server._abandon_agent_task", side_effect=fake_abandon) as abandon,
+        ):
+            task = asyncio.create_task(
+                adapter._run_nonstreaming_agent(
+                    request, user_message="hello", conversation_history=[]))
+            await started.wait()
+            request.transport = None
+            with pytest.raises(ConnectionResetError, match="HTTP client disconnected"):
+                await asyncio.wait_for(task, timeout=1.5)
+
+        abandon.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_handler_cancellation_hard_interrupts_nonstreaming_agent(self, adapter):
         """Server-side cancellation must use the same cleanup path."""
         started = asyncio.Event()
