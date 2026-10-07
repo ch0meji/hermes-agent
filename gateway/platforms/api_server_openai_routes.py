@@ -417,6 +417,7 @@ class OpenAICompatRoutesMixin:
         from gateway.platforms.api_server import _abandon_agent_task
 
         agent_ref = [None]
+        initial_transport = getattr(request, "transport", None)
         agent_task = asyncio.create_task(self._run_agent(agent_ref=agent_ref, **run_kwargs))
         try:
             while True:
@@ -424,7 +425,8 @@ class OpenAICompatRoutesMixin:
                     return await agent_task
 
                 transport = getattr(request, "transport", None)
-                if transport is not None and transport.is_closing():
+                if initial_transport is not None and (
+                        transport is None or transport.is_closing()):
                     await _abandon_agent_task(
                         agent_ref, agent_task, "HTTP client disconnected",
                         reap_source="api_server_nonstream_disconnect")
