@@ -406,6 +406,40 @@ class OpenAICompatRoutesMixin:
         agent_task.add_done_callback(lambda _fut: stream_q.put_nowait(None))
         return agent_task, agent_ref
 
+    async def _run_nonstreaming_agent(self, request: "web.Request", **run_kwargs) -> tuple:
+        """Run one non-streaming agent turn while the HTTP client remains connected.
+
+        aiohttp does not necessarily cancel a long-running handler when the peer disappears.
+        Poll the request transport so an abandoned client cannot leave an executor-backed agent
+        refreshing its durable session lease indefinitely.  Handler cancellation follows the
+        same hard-interrupt/reap path used by SSE disconnect handling.
+        """
+        from gateway.platforms.api_server import _abandon_agent_task
+
+        agent_ref = [None]
+        agent_task = asyncio.create_task(self._run_agent(agent_ref=agent_ref, **run_kwargs))
+        try:
+            while True:
+                if agent_task.done():
+                    return await agent_task
+
+                transport = getattr(request, "transport", None)
+                if transport is not None and transport.is_closing():
+                    await _abandon_agent_task(
+                        agent_ref, agent_task, "HTTP client disconnected",
+                        reap_source="api_server_nonstream_disconnect")
+                    raise ConnectionResetError("HTTP client disconnected")
+
+                try:
+                    return await asyncio.wait_for(asyncio.shield(agent_task), timeout=0.5)
+                except asyncio.TimeoutError:
+                    continue
+        except asyncio.CancelledError:
+            await _abandon_agent_task(
+                agent_ref, agent_task, "HTTP request cancelled",
+                reap_source="api_server_nonstream_cancelled", await_cancel=False)
+            raise
+
     async def _handle_chat_completions(self, request: "web.Request") -> "web.Response":
         """POST /v1/chat/completions — OpenAI Chat Completions format."""
         from gateway.platforms.api_server import (
@@ -530,7 +564,7 @@ class OpenAICompatRoutesMixin:
                 gateway_session_key=gateway_session_key)
 
         async def _compute_completion():
-            return await self._run_agent(**run_kwargs)
+            return await self._run_nonstreaming_agent(request, **run_kwargs)
         outcome, err = await self._run_idempotent(
             request, body, _compute_completion, log_label="chat completions",
             fingerprint_keys=["model", "provider", "model_options", "messages", "tools", "tool_choice", "stream"],
@@ -854,7 +888,7 @@ class OpenAICompatRoutesMixin:
                 session_id=session_id, gateway_session_key=gateway_session_key)
 
         async def _compute_response():
-            return await self._run_agent(**run_kwargs)
+            return await self._run_nonstreaming_agent(request, **run_kwargs)
         outcome, err = await self._run_idempotent(
             request, body, _compute_response, log_label="responses",
             fingerprint_keys=["input", "instructions", "previous_response_id", "conversation", "model", "provider", "model_options", "tools"],
