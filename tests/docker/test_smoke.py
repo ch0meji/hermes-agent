@@ -60,6 +60,33 @@ def test_dashboard_subcommand_present(built_image: str) -> None:
     )
 
 
+def test_development_tools_and_hermes_are_on_runtime_path(built_image: str) -> None:
+    """The unprivileged runtime user can invoke the baked tools without setup."""
+    script = """
+set -eu
+test "$(id -un)" = hermes
+for tool in gh jq rsync hermes; do
+    command -v "$tool" >/dev/null || { echo "missing from PATH: $tool" >&2; exit 1; }
+done
+hermes --version >/dev/null
+gh --version >/dev/null
+jq --version >/dev/null
+rsync --version >/dev/null
+"""
+    r = subprocess.run(
+        [
+            "docker", "run", "--rm", "--user", "hermes",
+            "--env", "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "--entrypoint", "/bin/sh", built_image, "-ec", script,
+        ],
+        capture_output=True, text=True, timeout=60,
+    )
+    assert r.returncode == 0, (
+        f"runtime tool/PATH smoke test failed (exit {r.returncode}): "
+        f"stdout={r.stdout[-2000:]!r} stderr={r.stderr[-2000:]!r}"
+    )
+
+
 def test_hermes_help_under_wrapped_init(built_image: str) -> None:
     """``docker run --init --rm <image> --help`` must exit 0.
 
